@@ -20,7 +20,11 @@ Two of the Microgrants' suggested tracks in one contract:
    to release (`release`); if the payer stays silent past the window, the
    payee may release and claim the funds, so funds can never lock forever.
    If delivery never happens, the payer is refunded after the deadline
-   (`refund`).
+   (`refund`). If the payer rejects a delivery inside the review window
+   (`rejectDelivery`), the payee has a **3-day cure window** to re-deliver
+   a corrected hash; if it does not cure in time, the payer may refund
+   (`refundAfterRejection`). A junk hash delivered just before the
+   deadline can no longer auto-pay after 7 days with no recourse.
 2. **Payment splitting** — one incoming USDC payment split across up to 5
    recipients in a single transaction, by basis points
    (`splitPayment`, shares must sum to 10,000; rounding dust goes to the
@@ -75,9 +79,9 @@ second track (revenue splits / team payouts) in the same deploy.
 
 | Path | What it is |
 |---|---|
-| `contracts/LamplightEscrow.sol` | The contract (Solidity 0.8.24, MIT). Pull-payment design, 7-day review window, deadline-checked delivery. Revised after review Oct 27, 2026 — Studio re-verification pending. |
+| `contracts/LamplightEscrow.sol` | The contract (Solidity 0.8.24, MIT). Pull-payment design, 7-day review window, deadline-checked delivery, payer reject + 3-day cure window, packed storage (5 slots). Revised after review Oct 27, 2026 — Studio re-verification pending. |
 | `studio-contract-reference.sol` | Studio's contract source BEFORE the Oct 27 revision (read-only reference for the diff). |
-| `test/LamplightEscrow.t.sol` | 44 Foundry tests — happy path, every revert, pull-payment cases, review-window cases, reentrancy, split fuzz. |
+| `test/LamplightEscrow.t.sol` | 67 Foundry tests — happy path, every revert, pull-payment cases, review-window cases, reentrancy, split fuzz, reject path, gas-guard sweep. |
 | `script/Deploy.s.sol` | Forge deploy script (Arc mainnet / testnet). |
 | `app/` | Static front-end (`index.html`, `app.js`, `abi.json`). Connects a wallet, creates / delivers / releases / refunds escrows, splits payments, and has a no-wallet simulated demo. |
 | `fork-demo.log` | Full end-to-end run on a local Anvil fork of Arc mainnet (chain 5042), with tx hashes and gas. |
@@ -90,7 +94,7 @@ second track (revenue splits / team payouts) in the same deploy.
 ## Tests — verified
 
 ```
-forge test   # 46 passed; 0 failed
+forge test   # 67 passed; 0 failed
 ```
 
 Coverage: create locks funds; full create → deliver → release path; every
@@ -100,7 +104,11 @@ transfers rejected); the 7-day review window (payee cannot claim inside it,
 can claim after it, payer can release inside or after it, refund after a
 delivery still reverts); the payout gas guard (an under-funded call reverts
 "Insufficient gas for payout"; a ~99,000-gas recipient is paid directly at
-the ~141,587-gas threshold, proving the full 100,000-gas cap is forwarded);
+the ~141,587-gas threshold, proving the full 100,000-gas cap is forwarded;
+a gas sweep over the threshold proves the property "if the guard passes,
+the payee is never credited", and a case in the gap between the old and new
+thresholds proves the old buffer would have credited silently where the new
+one fails loudly; a cold empty account is paid directly at the threshold);
 reentrancy (a malicious receiver reentering
 withdraw/release/refund is blocked, the settlement completes as a credit,
 and the credit is preserved); and the pull-payment cases — release/refund
@@ -111,10 +119,19 @@ that still reverts; a credit to a contract with no receive() is
 unrecoverable via `withdraw()` but pays out via `withdrawTo()` to a
 payable address; `createEscrow` and `splitPayment` reject the escrow
 contract itself as payee/recipient (a credit to it could never be
-withdrawn); plus a fuzz test proving split amounts sum to the
+withdrawn); the `Credited` event is emitted only on the failed-push path,
+so an indexer distinguishes a pull credit from a direct payment by its
+presence in the same transaction as the settlement event; the packed
+struct reads back exactly (uint96 amount, uint64 timestamps,
+deliveredAt != 0 as the delivered flag), and oversized amounts/deadlines
+revert rather than truncate; plus a fuzz test proving split amounts sum to the
 payment, every recipient except the last nonzero-share one gets exactly
 floor(value × share / 10000), the last nonzero-share one takes the dust,
-and a zero-share recipient gets nothing.
+and a zero-share recipient gets nothing; plus the reject path — reject
+inside the window then cure then release, reject after the window reverts,
+uncured rejection refunds after the 3-day cure window (and reverts before
+it), reject of an undelivered escrow reverts, double-reject reverts, and
+a cured delivery can be rejected again.
 
 ## Fork demo — verified on a local fork of Arc mainnet
 
@@ -158,26 +175,23 @@ demo payee/recipients — so the net sunk cost of going live is the gas:
 
 Built in Arc Studio (project
 https://studio.arc.io/app/16fcd6f7-5614-4e37-aee6-ad6575f83d73),
-deployed to Arc Testnet, and verified: 52/52 tests and a fork demo.
+deployed to Arc Testnet, and verified: 67/67 tests and a fork demo.
 Mainnet deploy, demo flow, and video walkthrough are next; the
 submission closes Nov 1, 2026.
 
-> **Revision note (Oct 27, 2026):** independent review of the contract
-> (three models, files + fixed demands, one shot each) found one High
-> issue — `deliver()` had no deadline check, so a payee could front-run
-> a refund with a junk hash — plus a Medium (a silent payer could lock
-> funds forever) and three Lows. All five are fixed in this repo:
-> deadline-checked delivery, a 7-day review window after which the
-> payee may claim, zero-amount payouts skipped, and a payout gas check.
-> A re-review (Oct 27, ~4:53 PM CDT) then found the gas check's 5,000
-> buffer did not cover the CALL's base cost — Claude, judgment sound;
-> Grok, no findings — so the buffer was raised to 40,000 with two
-> boundary tests (46/46 then). A second re-review (Oct 27, ~5:22 PM CDT)
-> found two more Lows, both called optional — the rounding dust went to
-> a zero-share last recipient, and a credit to a contract with no
-> receive() was unrecoverable — so the dust now goes to the last
-> nonzero-share recipient, `withdrawTo()` was added, and the escrow
-> contract itself is rejected as payee/recipient (52/52 now pass).
+> **Round 4 — "make it better" (Oct 27, 2026, evening):** the reviewers'
+> improvement and feature suggestions, implemented properly: the Escrow
+> struct is packed from 8 slots to 5 (uint96 amount, uint64 timestamps,
+> deliveredAt != 0 as the delivered flag) — `createEscrow` measured
+> 152,047 → 125,733 gas, 26,314 saved (~17%); the gas-guard tests are
+> now discriminating (a sweep proves "if the guard passes, the payee is
+> never credited", and a gap case proves the old 5,000 buffer would have
+> credited silently where the new 40,000 buffer fails loudly); the
+> `Credited` event is proven (log-based test) to fire only on the
+> failed-push path, so indexers can distinguish a pull credit from a
+> direct payment; and the payer reject + dispute path is in — a junk
+> delivery can be rejected inside the review window, the payee gets a
+> 3-day cure window to re-deliver, and an uncured rejection refunds.
 > The repo contract therefore **no longer matches the Studio build**;
 > Studio must be updated and re-verified to match before the mainnet
 > deploy. The fork-demo and mainnet-cost gas figures below are from the
@@ -191,14 +205,16 @@ submission closes Nov 1, 2026.
   credited party can withdraw their own credit.
 - Plain transfers are rejected, so funds only ever arrive through a
   tracked function.
-- **v1 has no arbitrator and no dispute path.** If payer and payee
-  disagree after delivery, the payer still holds the release during the
-  7-day review window — the payer's protection is verifying the delivery
-  hash before releasing, and refunding before the deadline if nothing is
-  delivered. The payee's protection is the review window: after it ends,
-  the payee may release and claim the funds, so a silent payer cannot
-  lock them forever. A dispute/arbitrator role is the planned v2. This
-  is stated in the app and the submission, not hidden.
+- **v1 has no third-party arbitrator.** If payer and payee disagree after
+  delivery, the payer may reject the delivery inside the 7-day review
+  window (`rejectDelivery`); the payee then has 3 days to cure with a
+  corrected hash, or the payer refunds. The payer's protection is
+  verifying the delivery hash before releasing, rejecting junk, and
+  refunding before the deadline if nothing is delivered. The payee's
+  protection is the review window: after it ends, the payee may release
+  and claim the funds, so a silent payer cannot lock them forever. A
+  third-party arbitrator role is the planned v2. This is stated in the
+  app and the submission, not hidden.
 - Not audited. Experimental software — use small amounts.
 
 ## Licence

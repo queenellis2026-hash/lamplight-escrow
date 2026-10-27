@@ -323,3 +323,66 @@ as a skeleton during the check).
   pre-revision contract and will shift slightly; then mainnet deploy,
   demo, video, submit. No GitHub push and no Studio change were made in
   this task.
+
+## 12 · Round 4 — "make it better" — DONE Oct 27, 2026 (evening)
+
+The reviewers' improvement + feature suggestions from the round-2
+re-review (Grok + Claude, updated brief rules 7+8), implemented
+properly per the standing grant ("make it better ellis not the easy way do
+what you think is best"). Only Grok's payer-cancel short-circuit was
+skipped (weaker than the reject path — redundant once reject exists).
+
+- **Struct packing (Claude improvement 4):** the Escrow struct went
+  from 8 slots to 5 — uint96 amount, uint64 deadline / deliveredAt /
+  rejectedAt, deliveredAt != 0 as the delivered flag (no separate bool).
+  `createEscrow` measured 152,047 → 125,733 gas (26,314 saved, ~17%;
+  measured with a throwaway gasleft() test, deleted after). Oversized
+  amounts (> 2**96 wei) and deadlines (> 2**64 s) revert rather than
+  truncate. The packed fields read back exactly (tested). Side effect:
+  the release path's pre-check gas burn dropped ~75,000 → ~33,000, so
+  the round-2 gas-guard test's hardcoded 195,000 limit stopped
+  reverting — re-tuned to 153,000 (lands at ~120,000 gas left).
+- **Discriminating gas-guard tests (Claude improvement 1):** the old
+  boundary test would also pass on the old 5,000 buffer, so it proved
+  nothing. Added a sweep (gas limits 150k–280k, ~99.9k burner) proving
+  the property "if the guard passes, the payee is never credited" with
+  monotonic outcomes, plus a gap case: a binary-searched minimum direct
+  -pay limit (174,384) minus 15,000 lands in the gap between the old and
+  new thresholds and must revert "Insufficient gas for payout" (old code
+  would have credited silently). The existing boundary test was kept.
+- **Cold empty account (Grok improvement 3, Arc leg):** a fresh address
+  with no code and no balance — the worst-case CALL base cost (36,600)
+  — is paid directly at the threshold limit, never credited.
+- **Credit event (Grok improvement 1):** checked — the `Credited` event
+  already fires ONLY on the failed-push path, and every settlement emits
+  its own event, so an indexer distinguishes a pull credit from a direct
+  payment by Credited's presence in the same transaction. Proven with a
+  log-based test (direct pay: Released, no Credited; failed push:
+  Released + exactly one Credited; split: SplitPaid + one Credited for
+  the broken recipient only). No event change was needed.
+- **Payer reject + dispute path (Claude feature):** `rejectDelivery()`
+  (payer only, inside the review window; at the exact boundary second
+  the payee may already claim, so the payee wins the boundary),
+  `refundAfterRejection()` (payer only, after the 3-day cure window),
+  `REJECT_CURE_PERIOD = 3 days`, `DeliveryRejected` event. A rejection
+  clears the delivery; the payee cures by re-delivering (fresh review
+  window, rejection cleared); a cured delivery can be rejected again.
+  The happy path is unchanged when no reject happens.
+- **Tests: 67 passed, 0 failed** (52 before + 15 new). No contract
+  correction was needed after the fixes, but the round surfaced and fixed
+  5 test-side issues: the "Already rejected" check was unreachable (a
+  rejection clears deliveredAt, so "Not delivered" fired first — checks
+  reordered); the credit-event test double-counted a credit across its
+  own parts (fresh recipient for the split part); the cold-account test
+  asserted an absolute balance the binary search had already changed
+  (assert the delta); the sweep's lower bound was above the new
+  threshold after packing (150k–280k now); the old underfund test's
+  hardcoded limit (see above).
+- **Deliberately left as-is:** Grok's payer-cancel short-circuit only.
+- **Still needed before deploy (Ellis, not this task):** update the
+  contract in Arc Studio to match the revised repo source and re-verify
+  (the repo NO LONGER matches Studio); re-run the fork demo
+  (`fork-demo.sh`) — the gas figures in README/§4 are from the
+  pre-revision contract and will shift; then mainnet deploy, demo,
+  video, submit. No GitHub push and no Studio change were made in
+  this task.

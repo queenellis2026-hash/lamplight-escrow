@@ -188,7 +188,7 @@ contract LamplightEscrowTest is Test {
         assertEq(e.payer, payer);
         assertEq(e.payee, payee);
         assertEq(e.amount, 0.5 ether);
-        assertFalse(e.delivered);
+        assertEq(e.deliveredAt, 0); // not delivered: deliveredAt == 0
         assertFalse(e.settled);
         assertEq(address(esc).balance, 0.5 ether);
     }
@@ -198,7 +198,7 @@ contract LamplightEscrowTest is Test {
         bytes32 h = keccak256("deliverable: bounty report v1");
         vm.prank(payee);
         esc.deliver(id, h);
-        assertTrue(esc.getEscrow(id).delivered);
+        assertTrue(esc.getEscrow(id).deliveredAt != 0);
 
         uint256 before = payee.balance;
         vm.prank(payer);
@@ -862,14 +862,14 @@ contract LamplightEscrowTest is Test {
         // The 40,000 buffer raises the threshold to ~141,587; a caller
         // leaving ~120,000 gas at the check (above the old threshold, below
         // the new one) must now fail loudly instead. The release path burns
-        // ~75,000 gas before the check (reentrancy guard + struct reads),
-        // so a 195,000 gas limit lands at ~120,000 gas left.
+        // ~33,000 gas before the check after struct packing (was ~75,000),
+        // so a 153,000 gas limit lands at ~120,000 gas left.
         uint256 id = _create(0.5 ether, 1 days);
         vm.prank(payee);
         esc.deliver(id, keccak256("x"));
         vm.prank(payer);
         vm.expectRevert("Insufficient gas for payout");
-        esc.release{gas: 195_000}(id);
+        esc.release{gas: 153_000}(id);
     }
 
     function testPayoutGasGuardForwardsFullCapAtBoundary() public {
@@ -1016,5 +1016,374 @@ contract LamplightEscrowTest is Test {
         vm.prank(payer);
         vm.expectRevert("Invalid recipient");
         esc.splitPayment{value: 1 ether}(r, s);
+    }
+
+    // ---- Round 4 (Oct 27, 2026): struct packing ----
+
+    function testPackedStructFieldsRoundTrip() public {
+        // The packed struct (uint96 amount, uint64 deadline/deliveredAt/
+        // rejectedAt, deliveredAt != 0 as the delivered flag) must read
+        // back exactly what createEscrow stored.
+        uint256 id = _create(0.5 ether, 1 days);
+        LamplightEscrow.Escrow memory e = esc.getEscrow(id);
+        assertEq(e.payer, payer);
+        assertEq(e.payee, payee);
+        assertEq(e.amount, 0.5 ether);
+        assertEq(e.deadline, block.timestamp + 1 days);
+        assertEq(e.deliveredAt, 0);
+        assertEq(e.rejectedAt, 0);
+        assertEq(e.workHash, bytes32(0));
+        assertFalse(e.settled);
+        // after delivery the packed fields update in place
+        vm.prank(payee);
+        esc.deliver(id, keccak256("x"));
+        e = esc.getEscrow(id);
+        assertEq(e.deliveredAt, block.timestamp);
+        assertEq(e.workHash, keccak256("x"));
+        assertFalse(e.settled);
+    }
+
+    function testCreateEscrowAmountTooLargeReverts() public {
+        // Amounts above 2**96 wei cannot fit the packed uint96 slot and
+        // must revert rather than truncate.
+        vm.deal(payer, type(uint256).max);
+        vm.prank(payer);
+        vm.expectRevert("Amount too large");
+        esc.createEscrow{value: uint256(type(uint96).max) + 1}(
+            payee,
+            block.timestamp + 1 days
+        );
+    }
+
+    function testCreateEscrowDeadlineTooLargeReverts() public {
+        // A deadline past 2**64 seconds cannot fit the packed uint64 slot.
+        vm.prank(payer);
+        vm.expectRevert("Invalid deadline");
+        esc.createEscrow{value: 0.1 ether}(payee, uint256(type(uint64).max) + 1);
+    }
+
+    // ---- Round 4: discriminating gas-guard tests (Claude improvement 1) ----
+
+    /// @dev Binary-search the smallest low-level gas limit at which
+    ///   release() to `payee_` succeeds. Each probe uses a fresh escrow
+    ///   (a successful probe settles it). The search adapts to the
+    ///   release path's actual pre-check gas burn, so the tests below do
+    ///   not hard-code it.
+    function _minGasForDirectPay(address payee_) internal returns (uint256) {
+        uint256 lo = 150_000; // known to revert at the guard
+        uint256 hi = 300_000; // known to succeed
+        while (lo + 1 < hi) {
+            uint256 mid = (lo + hi) / 2;
+            vm.prank(payer);
+            uint256 id = esc.createEscrow{value: 0.5 ether}(
+                payee_,
+                block.timestamp + 1 days
+            );
+            vm.prank(payee_);
+            esc.deliver(id, keccak256("x"));
+            vm.prank(payer);
+            (bool ok, ) = address(esc).call{gas: mid}(
+                abi.encodeWithSignature("release(uint256)", id)
+            );
+            if (ok) hi = mid;
+            else lo = mid;
+        }
+        return hi;
+    }
+
+    function testGasGuardSweepNeverCredits() public {
+        // Claude improvement 1: the property is "if the guard passes, the
+        // payee is never credited". Sweep the gas limit across the
+        // threshold with a ~99.9k burner: below the threshold the call
+        // must revert, above it the burner is paid directly — at NO limit
+        // may the burner be credited, and the outcomes must be monotonic
+        // (all reverts, then all successes).
+        uint256 firstSuccess = type(uint256).max;
+        uint256 lastRevert = 0;
+        for (uint256 limit = 150_000; limit <= 280_000; limit += 5_000) {
+            GasBurnerExact burner = new GasBurnerExact(99_900);
+            vm.prank(payer);
+            uint256 id = esc.createEscrow{value: 0.5 ether}(
+                address(burner),
+                block.timestamp + 1 days
+            );
+            vm.prank(address(burner));
+            esc.deliver(id, keccak256("x"));
+            vm.prank(payer);
+            (bool ok, ) = address(esc).call{gas: limit}(
+                abi.encodeWithSignature("release(uint256)", id)
+            );
+            // the property: a failed guard reverts, a passed guard pays —
+            // a credit must never appear at any gas limit.
+            assertEq(esc.pendingWithdrawals(address(burner)), 0);
+            if (ok) {
+                assertEq(address(burner).balance, 0.5 ether);
+                if (firstSuccess == type(uint256).max) firstSuccess = limit;
+            } else {
+                assertFalse(esc.getEscrow(id).settled);
+                lastRevert = limit;
+            }
+        }
+        assertTrue(firstSuccess != type(uint256).max, "no limit paid directly");
+        assertTrue(lastRevert != 0, "no limit reverted");
+        assertTrue(lastRevert < firstSuccess, "outcomes not monotonic");
+    }
+
+    function testGasGuardGapRevertsInsteadOfCrediting() public {
+        // The discriminating case the old boundary test missed: 15,000 gas
+        // below the new threshold, gasleft at the check lands in the gap
+        // between the old 5,000-buffer threshold (~106,587) and the new
+        // 40,000-buffer threshold (~141,587). Under the old buffer the
+        // guard would have passed here and the ~99.9k burner would have
+        // been credited silently (only ~90k forwarded after the CALL base
+        // cost). Under the new buffer it must fail loudly instead — and
+        // the escrow must stay unsettled with nothing credited.
+        GasBurnerExact burner = new GasBurnerExact(99_900);
+        uint256 minLimit = _minGasForDirectPay(address(burner));
+        vm.prank(payer);
+        uint256 id = esc.createEscrow{value: 0.5 ether}(
+            address(burner),
+            block.timestamp + 1 days
+        );
+        vm.prank(address(burner));
+        esc.deliver(id, keccak256("x"));
+        vm.prank(payer);
+        vm.expectRevert("Insufficient gas for payout");
+        esc.release{gas: minLimit - 15_000}(id);
+        assertEq(esc.pendingWithdrawals(address(burner)), 0);
+        assertFalse(esc.getEscrow(id).settled);
+    }
+
+    function testGasGuardCoversColdEmptyAccount() public {
+        // Grok improvement 3 (Arc): the worst-case CALL base cost is a
+        // cold, empty account — 2,600 cold + 9,000 value + 25,000 empty =
+        // 36,600, which the 40,000 buffer covers. A fresh address with no
+        // code and no balance, paid at the threshold limit, must be paid
+        // directly, never credited.
+        address coldEmpty = address(0xF00D);
+        assertEq(coldEmpty.balance, 0);
+        assertEq(coldEmpty.code.length, 0);
+        uint256 minLimit = _minGasForDirectPay(coldEmpty);
+        vm.prank(payer);
+        uint256 id = esc.createEscrow{value: 0.5 ether}(
+            coldEmpty,
+            block.timestamp + 1 days
+        );
+        vm.prank(coldEmpty);
+        esc.deliver(id, keccak256("x"));
+        uint256 before = coldEmpty.balance; // the binary search already
+        // paid this address on its successful probes; assert the delta
+        vm.prank(payer);
+        esc.release{gas: minLimit}(id);
+        assertEq(coldEmpty.balance, before + 0.5 ether);
+        assertEq(esc.pendingWithdrawals(coldEmpty), 0);
+        assertTrue(esc.getEscrow(id).settled);
+    }
+
+    // ---- Round 4: credit event distinguishability (Grok improvement 1) ----
+
+    bytes32 constant RELEASED_SIG = keccak256("Released(uint256,address,uint256)");
+    bytes32 constant CREDITED_SIG = keccak256("Credited(address,uint256)");
+    bytes32 constant SPLIT_PAID_SIG = keccak256("SplitPaid(address,uint256,uint256)");
+
+    function _hasEvent(Vm.Log[] memory logs, bytes32 sig) internal pure returns (bool) {
+        for (uint256 i = 0; i < logs.length; ++i) {
+            if (logs[i].topics[0] == sig) return true;
+        }
+        return false;
+    }
+
+    function _countEvent(Vm.Log[] memory logs, bytes32 sig) internal pure returns (uint256 n) {
+        for (uint256 i = 0; i < logs.length; ++i) {
+            if (logs[i].topics[0] == sig) ++n;
+        }
+    }
+
+    function testCreditedEventDistinguishesCreditFromDirectPay() public {
+        // Grok improvement 1, verified: the Credited event is emitted ONLY
+        // on the failed-push path, and every settlement emits its own
+        // event — so an indexer distinguishes a pull credit from a direct
+        // payment by the presence of Credited in the same transaction.
+        // (1) Direct payment: Released, no Credited.
+        vm.recordLogs();
+        uint256 id = _create(0.5 ether, 1 days);
+        vm.prank(payee);
+        esc.deliver(id, keccak256("x"));
+        vm.prank(payer);
+        esc.release(id);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertTrue(_hasEvent(logs, RELEASED_SIG));
+        assertFalse(_hasEvent(logs, CREDITED_SIG));
+        // (2) Failed push: Released AND Credited, credit matches the amount.
+        FlakyRecipient flaky = new FlakyRecipient();
+        vm.recordLogs();
+        vm.prank(payer);
+        uint256 id2 = esc.createEscrow{value: 0.5 ether}(
+            address(flaky),
+            block.timestamp + 1 days
+        );
+        vm.prank(address(flaky));
+        esc.deliver(id2, keccak256("x"));
+        vm.prank(payer);
+        esc.release(id2);
+        logs = vm.getRecordedLogs();
+        assertTrue(_hasEvent(logs, RELEASED_SIG));
+        assertTrue(_hasEvent(logs, CREDITED_SIG));
+        assertEq(_countEvent(logs, CREDITED_SIG), 1);
+        assertEq(esc.pendingWithdrawals(address(flaky)), 0.5 ether);
+        // (3) Split: SplitPaid + exactly one Credited, for the broken
+        // recipient only — the good recipient gets no Credited event.
+        // A fresh flaky recipient: the first one already holds a 0.5
+        // ether credit from part (2), and credits accumulate.
+        FlakyRecipient flaky2 = new FlakyRecipient();
+        vm.recordLogs();
+        address[] memory r = new address[](2);
+        r[0] = address(flaky2);
+        r[1] = third;
+        uint256[] memory s = new uint256[](2);
+        s[0] = 5000;
+        s[1] = 5000;
+        vm.prank(payer);
+        esc.splitPayment{value: 1 ether}(r, s);
+        logs = vm.getRecordedLogs();
+        assertTrue(_hasEvent(logs, SPLIT_PAID_SIG));
+        assertEq(_countEvent(logs, CREDITED_SIG), 1);
+        assertEq(esc.pendingWithdrawals(address(flaky2)), 0.5 ether);
+        assertEq(esc.pendingWithdrawals(third), 0);
+    }
+
+    // ---- Round 4: payer reject + dispute path (Claude feature) ----
+
+    function _delivered(uint256 amount) internal returns (uint256) {
+        uint256 id = _create(amount, 30 days);
+        vm.prank(payee);
+        esc.deliver(id, keccak256("work v1"));
+        return id;
+    }
+
+    function testRejectInsideWindowThenCure() public {
+        // The payer rejects a junk delivery inside the review window; the
+        // payee cures with a corrected hash; the cured delivery releases
+        // normally — the happy path is unchanged after a cure.
+        uint256 id = _delivered(0.5 ether);
+        vm.warp(block.timestamp + 1 days); // inside the 7-day window
+        vm.prank(payer);
+        esc.rejectDelivery(id);
+        LamplightEscrow.Escrow memory e = esc.getEscrow(id);
+        assertEq(e.deliveredAt, 0);
+        assertEq(e.rejectedAt, block.timestamp);
+        assertEq(e.workHash, bytes32(0));
+        assertFalse(e.settled);
+        // release is impossible while rejected (nothing delivered)
+        vm.prank(payer);
+        vm.expectRevert("Not delivered");
+        esc.release(id);
+        // the payee cures with a corrected hash
+        vm.prank(payee);
+        esc.deliver(id, keccak256("work v2 fixed"));
+        e = esc.getEscrow(id);
+        assertEq(e.rejectedAt, 0); // cure clears the rejection
+        assertEq(e.workHash, keccak256("work v2 fixed"));
+        // and the cured delivery releases normally
+        uint256 before = payee.balance;
+        vm.prank(payer);
+        esc.release(id);
+        assertEq(payee.balance, before + 0.5 ether);
+        assertTrue(esc.getEscrow(id).settled);
+    }
+
+    function testRejectAfterWindowReverts() public {
+        // A reject after the review window ends is too late: at the exact
+        // boundary second the payee may already claim, so the payee wins
+        // the boundary and the reject reverts.
+        uint256 id = _delivered(0.5 ether);
+        vm.warp(block.timestamp + 7 days); // exactly deliveredAt + REVIEW_PERIOD
+        vm.prank(payer);
+        vm.expectRevert("Review period ended");
+        esc.rejectDelivery(id);
+        // the payee claims instead, as the boundary rule provides
+        uint256 before = payee.balance;
+        vm.prank(payee);
+        esc.release(id);
+        assertEq(payee.balance, before + 0.5 ether);
+    }
+
+    function testRejectUncuredThenPayerRefunds() public {
+        // The payee does not cure within the 3-day cure window; the payer
+        // refunds. Before the cure window ends the refund reverts.
+        uint256 id = _delivered(0.5 ether);
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(payer);
+        esc.rejectDelivery(id);
+        uint256 rejectedAt = esc.getEscrow(id).rejectedAt;
+        vm.warp(block.timestamp + 2 days); // inside the cure window
+        vm.prank(payer);
+        vm.expectRevert("Cure period not ended");
+        esc.refundAfterRejection(id);
+        vm.warp(rejectedAt + 3 days); // cure window over
+        uint256 before = payer.balance;
+        vm.prank(payer);
+        esc.refundAfterRejection(id);
+        assertEq(payer.balance, before + 0.5 ether);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testRejectUndeliveredReverts() public {
+        // Rejecting an escrow with no delivery is meaningless and reverts.
+        uint256 id = _create(0.5 ether, 30 days);
+        vm.prank(payer);
+        vm.expectRevert("Not delivered");
+        esc.rejectDelivery(id);
+    }
+
+    function testRejectTwiceReverts() public {
+        // A second rejection of the same delivery reverts; the cure clock
+        // is not restarted by re-rejecting.
+        uint256 id = _delivered(0.5 ether);
+        vm.prank(payer);
+        esc.rejectDelivery(id);
+        vm.prank(payer);
+        vm.expectRevert("Already rejected");
+        esc.rejectDelivery(id);
+    }
+
+    function testRejectOnlyPayer() public {
+        uint256 id = _delivered(0.5 ether);
+        vm.prank(third);
+        vm.expectRevert("Only payer");
+        esc.rejectDelivery(id);
+        vm.prank(payee);
+        vm.expectRevert("Only payer");
+        esc.rejectDelivery(id);
+    }
+
+    function testRefundAfterRejectionOnlyAfterRejection() public {
+        // refundAfterRejection on a never-rejected escrow reverts, even
+        // after the deadline — the deadline path is refund(), not this one.
+        uint256 id = _create(0.5 ether, 1 days);
+        vm.warp(block.timestamp + 2 days);
+        vm.prank(payer);
+        vm.expectRevert("Not rejected");
+        esc.refundAfterRejection(id);
+    }
+
+    function testRejectThenCureThenRejectAgain() public {
+        // A cured delivery can be rejected again if the new hash is also
+        // junk — each rejection starts a fresh cure window.
+        uint256 id = _delivered(0.5 ether);
+        vm.prank(payer);
+        esc.rejectDelivery(id);
+        vm.prank(payee);
+        esc.deliver(id, keccak256("work v2 still junk"));
+        vm.prank(payer);
+        esc.rejectDelivery(id);
+        assertEq(esc.getEscrow(id).rejectedAt, block.timestamp);
+        // and the second rejection can also be cured
+        vm.prank(payee);
+        esc.deliver(id, keccak256("work v3 good"));
+        vm.prank(payer);
+        esc.release(id);
+        assertTrue(esc.getEscrow(id).settled);
     }
 }
