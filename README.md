@@ -36,7 +36,13 @@ broken recipient can never block a whole split. Ordinary (EOA)
 recipients are still paid in the same transaction — the credit is only
 the fallback. A payout call must leave enough gas that the full 100,000
 cap is actually forwarded (EVM 63/64 rule), so a caller cannot force a
-credit with a low gas limit — that fails loudly instead. Zero-share
+credit with a low gas limit — that fails loudly instead. The guard
+requires `gasleft() > (100,000 × 64/63) + 40,000`: the 40,000 buffer
+covers the CALL's own base cost (2,600 cold account + 9,000 value
+transfer + 25,000 if the target is empty, up to 36,600 worst case), so
+the full cap genuinely reaches the recipient. Two boundary tests prove
+it — a recipient burning ~99,000 gas is paid directly at the threshold,
+and an under-funded call reverts "Insufficient gas for payout". Zero-share
 recipients get no call at all. The contract was revised after
 independent review (Oct 27, 2026) and no longer matches the Arc Studio
 build exactly — Studio must be updated and re-verified to match before
@@ -80,7 +86,7 @@ second track (revenue splits / team payouts) in the same deploy.
 ## Tests — verified
 
 ```
-forge test   # 44 passed; 0 failed
+forge test   # 46 passed; 0 failed
 ```
 
 Coverage: create locks funds; full create → deliver → release path; every
@@ -88,7 +94,10 @@ revert (release before delivery, wrong caller, refund before/after deadline,
 deliver after deadline, zero value, past deadline, bad shares, direct
 transfers rejected); the 7-day review window (payee cannot claim inside it,
 can claim after it, payer can release inside or after it, refund after a
-delivery still reverts); reentrancy (a malicious receiver reentering
+delivery still reverts); the payout gas guard (an under-funded call reverts
+"Insufficient gas for payout"; a ~99,000-gas recipient is paid directly at
+the ~141,587-gas threshold, proving the full 100,000-gas cap is forwarded);
+reentrancy (a malicious receiver reentering
 withdraw/release/refund is blocked, the settlement completes as a credit,
 and the credit is preserved); and the pull-payment cases — release/refund
 credit a reverting or gas-burning recipient and the credit pays out on
@@ -139,7 +148,7 @@ demo payee/recipients — so the net sunk cost of going live is the gas:
 
 Built in Arc Studio (project
 https://studio.arc.io/app/16fcd6f7-5614-4e37-aee6-ad6575f83d73),
-deployed to Arc Testnet, and verified: 44/44 tests and a fork demo.
+deployed to Arc Testnet, and verified: 46/46 tests and a fork demo.
 Mainnet deploy, demo flow, and video walkthrough are next; the
 submission closes Nov 1, 2026.
 
@@ -150,11 +159,14 @@ submission closes Nov 1, 2026.
 > funds forever) and three Lows. All five are fixed in this repo:
 > deadline-checked delivery, a 7-day review window after which the
 > payee may claim, zero-amount payouts skipped, and a payout gas check.
-> The repo contract therefore **no longer matches the Studio build**;
-> Studio must be updated and re-verified to match before the mainnet
-> deploy. The fork-demo and mainnet-cost gas figures below are from the
-> pre-revision contract and will be re-measured when the fork demo is
-> re-run.
+> A re-review (Oct 27, ~4:53 PM CDT) then found the gas check's 5,000
+> buffer did not cover the CALL's base cost — Claude, judgment sound;
+> Grok, no findings — so the buffer was raised to 40,000 with two
+> boundary tests (46/46 now pass). The repo contract therefore **no
+> longer matches the Studio build**; Studio must be updated and
+> re-verified to match before the mainnet deploy. The fork-demo and
+> mainnet-cost gas figures below are from the pre-revision contract and
+> will be re-measured when the fork demo is re-run.
 
 ## Security notes / limits
 

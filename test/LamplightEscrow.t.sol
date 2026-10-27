@@ -40,6 +40,27 @@ contract GasBurner {
     }
 }
 
+/// @notice A recipient that burns a fixed, configurable amount of gas in
+///   receive(). Lets a test prove the payout gas guard forwards the full
+///   100,000 gas: a ~95k burn is paid directly at the new threshold, while
+///   under the old 5,000 buffer the same gas limit would have forwarded
+///   only ~93.5k and credited it instead. If the forwarded gas is ever
+///   less than the burn amount, the spin loop runs the call out of gas and
+///   the amount is credited — the correct failure mode.
+contract GasBurnerExact {
+    uint256 public immutable burnAmount;
+
+    constructor(uint256 burnAmount_) {
+        burnAmount = burnAmount_;
+    }
+
+    receive() external payable {
+        uint256 start = gasleft();
+        uint256 target = start > burnAmount ? start - burnAmount : 0;
+        while (gasleft() > target) {}
+    }
+}
+
 /// @notice A payee/payer that tries to reenter the escrow from receive().
 ///   Proves the nonReentrant guard holds: the reentry reverts, the
 ///   settlement still completes, and any credit is preserved.
@@ -772,6 +793,48 @@ contract LamplightEscrowTest is Test {
         assertEq(esc.pendingWithdrawals(payee), 0);
         assertEq(esc.pendingWithdrawals(third), 0);
         assertEq(esc.pendingWithdrawals(payer), 0);
+        assertEq(address(esc).balance, 0);
+    }
+
+    // ---- Re-review fix (Oct 27, 2026): gas-guard buffer ----
+
+    function testPayoutGasGuardRevertsWhenCallerUnderfundsGas() public {
+        // Re-review Low: the old 5,000 buffer did not cover the CALL base
+        // cost, so a caller could tune the gas limit to just above the old
+        // threshold (~106,587) and silently under-forward to the payee.
+        // The 40,000 buffer raises the threshold to ~141,587; a caller
+        // leaving ~120,000 gas at the check (above the old threshold, below
+        // the new one) must now fail loudly instead. The release path burns
+        // ~75,000 gas before the check (reentrancy guard + struct reads),
+        // so a 195,000 gas limit lands at ~120,000 gas left.
+        uint256 id = _create(0.5 ether, 1 days);
+        vm.prank(payee);
+        esc.deliver(id, keccak256("x"));
+        vm.prank(payer);
+        vm.expectRevert("Insufficient gas for payout");
+        esc.release{gas: 195_000}(id);
+    }
+
+    function testPayoutGasGuardForwardsFullCapAtBoundary() public {
+        // Re-review Low: at the new threshold (~141,587 gas left at the
+        // check), the full 100,000 gas must actually reach the recipient.
+        // A recipient burning ~99,000 gas is paid directly — under the old
+        // 5,000 buffer the same gas limit would have forwarded only ~93.5k
+        // and credited it instead. A 220,000 gas limit lands at ~145,000
+        // gas left at the check, just above the threshold.
+        GasBurnerExact burner = new GasBurnerExact(99_000);
+        vm.prank(payer);
+        uint256 id = esc.createEscrow{value: 0.5 ether}(
+            address(burner),
+            block.timestamp + 1 days
+        );
+        vm.prank(address(burner));
+        esc.deliver(id, keccak256("x"));
+        vm.prank(payer);
+        esc.release{gas: 220_000}(id);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(address(burner).balance, 0.5 ether);
+        assertEq(esc.pendingWithdrawals(address(burner)), 0);
         assertEq(address(esc).balance, 0);
     }
 }

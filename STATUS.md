@@ -57,7 +57,7 @@ the wallet-fill research found for Base ETH.
 |---|---|
 | `contracts/LamplightEscrow.sol` | REVISED Oct 27 ~4:10 PM CDT — escrow (create/deliver/release/refund) + splitPayment, reentrancy guard, decimal-agnostic native-USDC handling, MIT. **Post-review revision: deadline-checked delivery, 7-day review window (payee may claim after it), zero-amount skip, payout gas check (see §11). Repo NO LONGER matches Studio — Studio re-verification required before deploy.** |
 | `studio-contract-reference.sol` | DONE — Studio's contract source BEFORE the Oct 27 revision, read-only reference for the diff. |
-| `test/LamplightEscrow.t.sol` | DONE — **44/44 Foundry tests pass** (`forge test`), happy path + every revert + pull cases + review-window cases + reentrancy + split fuzz (see §11) |
+| `test/LamplightEscrow.t.sol` | DONE — **46/46 Foundry tests pass** (`forge test`), happy path + every revert + pull cases + review-window cases + reentrancy + split fuzz + payout-gas-guard boundary tests (see §11) |
 | `script/Deploy.s.sol` | DONE — Forge deploy script for Arc mainnet/testnet |
 | `app/index.html` + `app.js` + `abi.json` | DONE — static front-end: connect wallet, add Arc network, create/deliver/release/refund, look up escrows, split payments, no-wallet simulated demo. Served locally and verified (200s, `node --check` clean). **STALE since the pull switch: ABI + UI still describe the push design; needs a withdraw pass before it matches the contract (Studio Vite app is the live app).** |
 | `fork-demo.log` | DONE — full end-to-end run on a local Anvil fork of Arc mainnet (chain 5042): deploy (1,104,020 gas), 0.27 USDC escrow create → deliver → release, 0.10 USDC 50/50 split with a reverting recipient (credited 0.05, withdrawn 0.05); every balance verified, contract ends at 0. Script: `fork-demo.sh` (re-runnable, fresh keys each run). |
@@ -245,10 +245,18 @@ as a skeleton during the check).
      v1 (documented in README).
   3. **LOW — a caller could force a credit with a low gas limit.**
      Fixed: `_payOrCredit` now requires
-     `gasleft() > (PAYOUT_GAS_LIMIT * 64) / 63 + 5_000` before the call,
-     so the full 100,000-gas cap is actually forwarded (EVM 63/64 rule);
-     a low-gas call fails loudly instead of silently crediting. New
-     revert string: "Insufficient gas for payout".
+     `gasleft() > (PAYOUT_GAS_LIMIT * 64) / 63 + PAYOUT_GAS_BUFFER`
+     before the call, so the full 100,000-gas cap is actually forwarded
+     (EVM 63/64 rule); a low-gas call fails loudly instead of silently
+     crediting. New revert string: "Insufficient gas for payout".
+     **Re-review (Oct 27, ~4:53 PM CDT, Claude — judgment sound; Grok —
+     no findings):** the 5,000 buffer did not cover the CALL's own base
+     cost (2,600 cold + 9,000 value + 25,000 if the target is empty =
+     up to 36,600), so a caller could still tune the gas limit to
+     forward only ~93.5k to a ~97k-gas recipient. Fixed: buffer raised
+     to 40,000, covering the worst-case base cost with margin, plus two
+     boundary tests (under-funded call reverts; a ~99k-gas recipient is
+     paid directly at the ~141,587-gas threshold). Total now 46 tests.
   4. **LOW — zero-share recipients got a call and a bogus Credited
      event.** Fixed: splitPayment() skips `_payOrCredit` when the
      computed amount is 0.
@@ -267,8 +275,9 @@ as a skeleton during the check).
   array; split fuzz test (256 runs) proving amounts sum to msg.value and
   match floor(value × share / 10000) for the first n−1 recipients, with
   the contract balance ending at 0.
-- **Verification:** `forge test` — **44 passed, 0 failed** (was 25/25
-  before the revision). Two test-side bugs were found and fixed during
+- **Verification:** `forge test` — **46 passed, 0 failed** (was 25/25
+  before the revision, 44/44 after it; the re-review added 2 boundary
+  tests for the gas-guard buffer). Two test-side bugs were found and fixed during
   the run (a reverted receive() frame rolls back its own flag reset, so
   the attacker helper needed an explicit disarm(); one balance assertion
   miscounted who funded the escrow). The contract itself needed no

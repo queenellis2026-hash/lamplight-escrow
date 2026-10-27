@@ -73,10 +73,15 @@ contract LamplightEscrow {
     ///   cannot lock the funds forever.
     uint256 public constant REVIEW_PERIOD = 7 days;
 
-    /// @dev Extra gas required above the 63/64-rule minimum in _payOrCredit,
-    ///   covering the gas check itself so the full PAYOUT_GAS_LIMIT is
-    ///   actually forwarded.
-    uint256 private constant PAYOUT_GAS_BUFFER = 5_000;
+    /// @dev Extra gas required above the 63/64-rule minimum in _payOrCredit.
+    ///   The 63/64 cap is applied AFTER the CALL's own base cost is charged
+    ///   (2,600 cold account + 9,000 value transfer + 25,000 if the target
+    ///   account is empty — up to 36,600 worst case), so a small buffer does
+    ///   not actually guarantee the full PAYOUT_GAS_LIMIT is forwarded: with
+    ///   a 5,000 buffer a caller could tune the gas limit so a payee whose
+    ///   receive() costs ~97k gas was credited instead of paid directly.
+    ///   40,000 covers the worst-case CALL base cost with margin.
+    uint256 private constant PAYOUT_GAS_BUFFER = 40_000;
 
     event EscrowCreated(
         uint256 indexed id,
