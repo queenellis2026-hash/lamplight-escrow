@@ -61,6 +61,37 @@ contract GasBurnerExact {
     }
 }
 
+/// @notice A contract with no receive() or fallback at all: it can never
+///   accept a native-token payment. Proves a credit to such a contract is
+///   unrecoverable via withdraw() (which pays to the credited address
+///   itself) but recoverable via withdrawTo() to a payable address.
+///   Also the exact repro for the unrecoverable-credit finding: such a
+///   contract funds an escrow, misses its deadline, and is credited on
+///   refund because the direct payout fails.
+contract NoReceive {
+    /// @dev Contracts cannot sign transactions, so these helpers let the
+    ///   test drive the escrow as this contract.
+    function createEscrowAsPayer(address payable escrow_, address payee_, uint256 deadline)
+        external
+        payable
+        returns (uint256)
+    {
+        return LamplightEscrow(escrow_).createEscrow{value: msg.value}(payee_, deadline);
+    }
+
+    function refundAsPayer(address payable escrow_, uint256 id) external {
+        LamplightEscrow(escrow_).refund(id);
+    }
+
+    function withdrawAsCreditor(address payable escrow_) external {
+        LamplightEscrow(escrow_).withdraw();
+    }
+
+    function withdrawToAsCreditor(address payable escrow_, address to) external {
+        LamplightEscrow(escrow_).withdrawTo(to);
+    }
+}
+
 /// @notice A payee/payer that tries to reenter the escrow from receive().
 ///   Proves the nonReentrant guard holds: the reentry reverts, the
 ///   settlement still completes, and any credit is preserved.
@@ -758,15 +789,39 @@ contract LamplightEscrowTest is Test {
     }
 
     function testFuzzSplitPaymentSumsToValue(uint256 value, uint256 s0, uint256 s1) public {
-        // Finding 5: for any value and any shares summing to 10000, the
-        // first n-1 recipients get exactly floor(value * share / 10000),
-        // the last takes the dust, the split sums to value, and nothing
-        // is left in the contract.
+        // Finding 5 (re-review round 3): the LAST NONZERO-share recipient
+        // takes the dust — not necessarily the last recipient. For any
+        // value and any shares summing to 10000, every recipient except
+        // the last nonzero-share one gets exactly floor(value * share /
+        // 10000), the last nonzero-share one gets the remainder, a
+        // zero-share recipient gets nothing, the split sums to value, and
+        // nothing is left in the contract.
         value = bound(value, 1, 10 ether);
         s0 = bound(s0, 0, 10000);
         s1 = bound(s1, 0, 10000 - s0);
         uint256 s2 = 10000 - s0 - s1;
 
+        (uint256 got0, uint256 got1, uint256 got2) =
+            _splitAndMeasure(value, s0, s1, s2);
+        (uint256 expect0, uint256 expect1, uint256 expect2) =
+            _splitExpectations(value, s0, s1, s2);
+
+        assertEq(got0, expect0);
+        assertEq(got1, expect1);
+        assertEq(got2, expect2);
+        assertEq(got0 + got1 + got2, value);
+        assertEq(esc.pendingWithdrawals(payee), 0);
+        assertEq(esc.pendingWithdrawals(third), 0);
+        assertEq(esc.pendingWithdrawals(payer), 0);
+        assertEq(address(esc).balance, 0);
+    }
+
+    /// @dev Run a 3-way split as the payer and return what each recipient
+    ///   netted (the payer's figure nets out the value it sent).
+    function _splitAndMeasure(uint256 value, uint256 s0, uint256 s1, uint256 s2)
+        internal
+        returns (uint256, uint256, uint256)
+    {
         address[] memory r = new address[](3);
         r[0] = payee;
         r[1] = third;
@@ -775,25 +830,27 @@ contract LamplightEscrowTest is Test {
         s[0] = s0;
         s[1] = s1;
         s[2] = s2;
-
         uint256 b0 = payee.balance;
         uint256 b1 = third.balance;
         uint256 b2 = payer.balance;
         vm.prank(payer);
         esc.splitPayment{value: value}(r, s);
+        return (payee.balance - b0, third.balance - b1, (payer.balance + value) - b2);
+    }
 
-        uint256 got0 = payee.balance - b0;
-        uint256 got1 = third.balance - b1;
-        uint256 got2 = (payer.balance + value) - b2;
-
-        assertEq(got0, (value * s0) / 10000);
-        assertEq(got1, (value * s1) / 10000);
-        assertEq(got2, value - got0 - got1);
-        assertEq(got0 + got1 + got2, value);
-        assertEq(esc.pendingWithdrawals(payee), 0);
-        assertEq(esc.pendingWithdrawals(third), 0);
-        assertEq(esc.pendingWithdrawals(payer), 0);
-        assertEq(address(esc).balance, 0);
+    /// @dev Expected split amounts under the dust rule: the last NONZERO-share
+    ///   recipient takes the remainder; every other recipient gets exactly
+    ///   floor(value * share / 10000); a zero-share recipient gets nothing.
+    function _splitExpectations(uint256 value, uint256 s0, uint256 s1, uint256 s2)
+        internal
+        pure
+        returns (uint256, uint256, uint256)
+    {
+        uint256 lastNz = s2 > 0 ? 2 : (s1 > 0 ? 1 : 0);
+        uint256 expect0 = lastNz == 0 ? value : (value * s0) / 10000;
+        uint256 expect1 = lastNz == 1 ? value - expect0 : (value * s1) / 10000;
+        uint256 expect2 = lastNz == 2 ? value - expect0 - expect1 : 0;
+        return (expect0, expect1, expect2);
     }
 
     // ---- Re-review fix (Oct 27, 2026): gas-guard buffer ----
@@ -836,5 +893,128 @@ contract LamplightEscrowTest is Test {
         assertEq(address(burner).balance, 0.5 ether);
         assertEq(esc.pendingWithdrawals(address(burner)), 0);
         assertEq(address(esc).balance, 0);
+    }
+
+    // ---- Re-review round 3 (Oct 27, 2026): dust + unrecoverable credit ----
+
+    function testSplitPaymentZeroShareLastGetsNoDust() public {
+        // Claude Low (round 3): the exact repro. splitPayment{value: 1}
+        // with shares [5000, 5000, 0] must NOT pay or call the zero-share
+        // last recipient: the 1 wei of dust goes to the last NONZERO-share
+        // recipient (third), and the zero-share last gets nothing — not
+        // even a call, so a reverting one gets no spurious Credited event.
+        FlakyRecipient flaky = new FlakyRecipient(); // reverting, as C
+        address[] memory r = new address[](3);
+        r[0] = payee;
+        r[1] = third;
+        r[2] = address(flaky);
+        uint256[] memory s = new uint256[](3);
+        s[0] = 5000;
+        s[1] = 5000;
+        s[2] = 0;
+        uint256 b0 = payee.balance;
+        uint256 b1 = third.balance;
+        vm.prank(payer);
+        esc.splitPayment{value: 1}(r, s);
+        assertEq(payee.balance, b0); // 0 share, 0 wei — and no call
+        assertEq(third.balance, b1 + 1); // dust to the last nonzero share
+        assertEq(esc.pendingWithdrawals(address(flaky)), 0); // no call, no credit
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testSplitPaymentDustGoesToLastNonZeroShare() public {
+        // The dust still lands with a nonzero-share last recipient:
+        // value 3, shares [5000, 3000, 2000] -> floors 1 and 0, last
+        // takes 3 - 1 - 0 = 2 (its 0 floor + 2 dust).
+        address[] memory r = new address[](3);
+        r[0] = payee;
+        r[1] = third;
+        r[2] = payer;
+        uint256[] memory s = new uint256[](3);
+        s[0] = 5000;
+        s[1] = 3000;
+        s[2] = 2000;
+        uint256 b0 = payee.balance;
+        uint256 b1 = third.balance;
+        uint256 b2 = payer.balance;
+        vm.prank(payer);
+        esc.splitPayment{value: 3}(r, s);
+        assertEq(payee.balance, b0 + 1);
+        assertEq(third.balance, b1);
+        // payer sent 3 and got 2 back as the last recipient: net -1
+        assertEq(payer.balance, b2 - 1);
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testWithdrawToRecoversCreditForNonPayableContract() public {
+        // Claude Low (round 3): the exact repro. A contract with no
+        // payable receive() funds an escrow and misses its deadline; the
+        // refund's direct payout fails, so it is credited — and
+        // withdraw() to itself then reverts with "Payment failed"
+        // forever. withdrawTo() to a payable address recovers it.
+        NoReceive nr = new NoReceive();
+        vm.deal(address(nr), 1 ether);
+        uint256 id = nr.createEscrowAsPayer{value: 0.5 ether}(
+            payable(address(esc)),
+            payee,
+            block.timestamp + 1 days
+        );
+        vm.warp(block.timestamp + 2 days);
+        nr.refundAsPayer(payable(address(esc)), id);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(esc.pendingWithdrawals(address(nr)), 0.5 ether);
+        assertEq(address(esc).balance, 0.5 ether);
+
+        vm.expectRevert("Payment failed");
+        nr.withdrawAsCreditor(payable(address(esc)));
+        assertEq(esc.pendingWithdrawals(address(nr)), 0.5 ether);
+
+        uint256 b = third.balance;
+        nr.withdrawToAsCreditor(payable(address(esc)), third);
+        assertEq(third.balance, b + 0.5 ether);
+        assertEq(esc.pendingWithdrawals(address(nr)), 0);
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testWithdrawToZeroAddressReverts() public {
+        // withdrawTo() to the zero address is rejected, not silently lost.
+        FlakyRecipient flaky = new FlakyRecipient();
+        vm.prank(payer);
+        uint256 id = esc.createEscrow{value: 0.5 ether}(
+            address(flaky),
+            block.timestamp + 1 days
+        );
+        vm.prank(address(flaky));
+        esc.deliver(id, keccak256("x"));
+        vm.prank(payer);
+        esc.release(id);
+        assertEq(esc.pendingWithdrawals(address(flaky)), 0.5 ether);
+        vm.prank(address(flaky));
+        vm.expectRevert("Zero recipient");
+        esc.withdrawTo(address(0));
+        assertEq(esc.pendingWithdrawals(address(flaky)), 0.5 ether);
+    }
+
+    function testCreateEscrowRejectsEscrowContractAsPayee() public {
+        // A payee of address(this) would strand the payout: release()
+        // pays the escrow, its receive() reverts, the amount is credited
+        // to the escrow itself, and the escrow can never withdraw.
+        vm.prank(payer);
+        vm.expectRevert("Invalid payee");
+        esc.createEscrow{value: 0.1 ether}(address(esc), block.timestamp + 1 days);
+    }
+
+    function testSplitPaymentRejectsEscrowContractAsRecipient() public {
+        // Same stranding in a split: address(this) as a recipient would
+        // be credited on the failed call and could never pull it.
+        address[] memory r = new address[](2);
+        r[0] = payee;
+        r[1] = address(esc);
+        uint256[] memory s = new uint256[](2);
+        s[0] = 5000;
+        s[1] = 5000;
+        vm.prank(payer);
+        vm.expectRevert("Invalid recipient");
+        esc.splitPayment{value: 1 ether}(r, s);
     }
 }

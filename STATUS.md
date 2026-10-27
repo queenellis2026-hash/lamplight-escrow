@@ -57,7 +57,7 @@ the wallet-fill research found for Base ETH.
 |---|---|
 | `contracts/LamplightEscrow.sol` | REVISED Oct 27 ~4:10 PM CDT — escrow (create/deliver/release/refund) + splitPayment, reentrancy guard, decimal-agnostic native-USDC handling, MIT. **Post-review revision: deadline-checked delivery, 7-day review window (payee may claim after it), zero-amount skip, payout gas check (see §11). Repo NO LONGER matches Studio — Studio re-verification required before deploy.** |
 | `studio-contract-reference.sol` | DONE — Studio's contract source BEFORE the Oct 27 revision, read-only reference for the diff. |
-| `test/LamplightEscrow.t.sol` | DONE — **46/46 Foundry tests pass** (`forge test`), happy path + every revert + pull cases + review-window cases + reentrancy + split fuzz + payout-gas-guard boundary tests (see §11) |
+| `test/LamplightEscrow.t.sol` | DONE — **52/52 Foundry tests pass** (`forge test`), happy path + every revert + pull cases + review-window cases + reentrancy + split fuzz + payout-gas-guard boundary tests + dust/withdrawTo/address(this) cases (see §11) |
 | `script/Deploy.s.sol` | DONE — Forge deploy script for Arc mainnet/testnet |
 | `app/index.html` + `app.js` + `abi.json` | DONE — static front-end: connect wallet, add Arc network, create/deliver/release/refund, look up escrows, split payments, no-wallet simulated demo. Served locally and verified (200s, `node --check` clean). **STALE since the pull switch: ABI + UI still describe the push design; needs a withdraw pass before it matches the contract (Studio Vite app is the live app).** |
 | `fork-demo.log` | DONE — full end-to-end run on a local Anvil fork of Arc mainnet (chain 5042): deploy (1,104,020 gas), 0.27 USDC escrow create → deliver → release, 0.10 USDC 50/50 split with a reverting recipient (credited 0.05, withdrawn 0.05); every balance verified, contract ends at 0. Script: `fork-demo.sh` (re-runnable, fresh keys each run). |
@@ -259,9 +259,31 @@ as a skeleton during the check).
      paid directly at the ~141,587-gas threshold). Total now 46 tests.
   4. **LOW — zero-share recipients got a call and a bogus Credited
      event.** Fixed: splitPayment() skips `_payOrCredit` when the
-     computed amount is 0.
+     computed amount is 0. **Re-review round 2 (Oct 27, ~5:22 PM CDT,
+     Claude — judgment sound, both Lows called optional; Grok — no
+     findings):** the dust still went to a zero-share LAST recipient —
+     splitPayment{value: 1}([A,B,C], [5000,5000,0]) paid C the full 1 wei
+     and made a payout call. Fixed: the remainder now goes to the last
+     recipient with a nonzero share, so a zero-share recipient gets no
+     payment and no call. New tests: the exact 1-wei repro (zero-share
+     last gets nothing, contract balance 0), and dust to a nonzero-share
+     last recipient. Fuzz-test invariant updated to the last-nonzero
+     rule. Total now 52 tests.
   5. **LOW — tests missed the main safety paths.** Fixed: 19 new tests
      (see below).
+  6. **LOW (round-2 re-review) — a credit could be unrecoverable.**
+     withdraw() could only pull a credit to the credited address itself,
+     so a contract with no payable receive() that missed a deadline was
+     credited a refund it could never pull ("Payment failed" forever),
+     and a credit to the escrow contract itself was stranded the same
+     way. Fixed: new `withdrawTo(address)` — a credited party pulls its
+     credit to a different address (zero address rejected, "Invalid
+     recipient"); and `createEscrow` / `splitPayment` reject
+     `address(this)` as payee/recipient ("Invalid recipient"), so a
+     credit can never be stranded inside the contract. New tests: a
+     credited no-receive contract recovers its full credit via
+     withdrawTo(); withdrawTo() to the zero address reverts; the escrow
+     contract itself is rejected as payee and as split recipient.
 - **New tests (19, total 25 → 44, all passing):** deliver-after-deadline
   reverts (proves fix 1); payee cannot claim inside the window; payee
   claims after the window; payer releases inside and after the window;
@@ -275,17 +297,25 @@ as a skeleton during the check).
   array; split fuzz test (256 runs) proving amounts sum to msg.value and
   match floor(value × share / 10000) for the first n−1 recipients, with
   the contract balance ending at 0.
-- **Verification:** `forge test` — **46 passed, 0 failed** (was 25/25
+- **Verification:** `forge test` — **52 passed, 0 failed** (was 25/25
   before the revision, 44/44 after it; the re-review added 2 boundary
-  tests for the gas-guard buffer). Two test-side bugs were found and fixed during
+  tests for the gas-guard buffer, and the round-2 re-review added 6
+  more — dust, withdrawTo, and address(this) rejection). Two test-side bugs were found and fixed during
   the run (a reverted receive() frame rolls back its own flag reset, so
   the attacker helper needed an explicit disarm(); one balance assertion
   miscounted who funded the escrow). The contract itself needed no
-  correction after the fixes.
-- **Deliberately left as-is:** nothing in Claude's list is unfixed. The
-  v1 trust model (payer-as-arbiter, no arbitrator/dispute path) is
-  unchanged by design — the review window bounds it, it does not replace
-  it.
+  correction after the fixes. During the round-3 test work a "Stack too
+  deep" compiler error in the fuzz test was fixed by extracting the
+  split-and-measure step into an internal helper, and a test append
+  accidentally dropped the gas-guard boundary test — caught by a
+  test-list diff and restored before reporting.
+- **Deliberately left as-is:** nothing in either reviewer's list is
+  unfixed. The v1 trust model (payer-as-arbiter, no arbitrator/dispute
+  path) is unchanged by design — the review window bounds it, it does
+  not replace it. Reviewers' improvement and new-feature suggestions
+  (gas-test discrimination, struct packing, payer reject/dispute path,
+  payer cancel) were NOT implemented in this round — findings only, per
+  instruction; those are a separate decision.
 - **Still needed before deploy (Ellis, not this task):** update the
   contract in Arc Studio to match the revised repo source and re-verify
   (the repo NO LONGER matches Studio); re-run the fork demo

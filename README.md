@@ -24,13 +24,17 @@ Two of the Microgrants' suggested tracks in one contract:
 2. **Payment splitting** — one incoming USDC payment split across up to 5
    recipients in a single transaction, by basis points
    (`splitPayment`, shares must sum to 10,000; rounding dust goes to the
-   last recipient so nothing is ever trapped).
+   last recipient with a nonzero share, so a zero-share recipient gets
+   no call at all and nothing is ever trapped).
 
 **Payouts are pull payments.** `release` / `refund` / `splitPayment`
 first try a direct payout capped at 100,000 gas; if that fails — the
 recipient is a contract that reverts, or one that burns more gas than the
 cap — the amount is credited to `pendingWithdrawals` instead, and the
-recipient pulls it later with `withdraw()`. A payout never reverts the
+recipient pulls it later with `withdraw()`, or to a different address
+with `withdrawTo()` (a credit to a contract with no payable receive()
+can never be pulled to itself, so `withdrawTo()` is the only recovery
+path). A payout never reverts the
 settlement, so a broken payee can never grief-block a release, and one
 broken recipient can never block a whole split. Ordinary (EOA)
 recipients are still paid in the same transaction — the credit is only
@@ -103,8 +107,14 @@ and the credit is preserved); and the pull-payment cases — release/refund
 credit a reverting or gas-burning recipient and the credit pays out on
 `withdraw()`; split pays the good recipients and credits the broken one;
 withdraw reverts with no credit, on a double-withdraw, or to a recipient
-that still reverts; plus a fuzz test proving split amounts sum to the
-payment and match floor(value × share / 10000) for the first n−1 recipients.
+that still reverts; a credit to a contract with no receive() is
+unrecoverable via `withdraw()` but pays out via `withdrawTo()` to a
+payable address; `createEscrow` and `splitPayment` reject the escrow
+contract itself as payee/recipient (a credit to it could never be
+withdrawn); plus a fuzz test proving split amounts sum to the
+payment, every recipient except the last nonzero-share one gets exactly
+floor(value × share / 10000), the last nonzero-share one takes the dust,
+and a zero-share recipient gets nothing.
 
 ## Fork demo — verified on a local fork of Arc mainnet
 
@@ -148,7 +158,7 @@ demo payee/recipients — so the net sunk cost of going live is the gas:
 
 Built in Arc Studio (project
 https://studio.arc.io/app/16fcd6f7-5614-4e37-aee6-ad6575f83d73),
-deployed to Arc Testnet, and verified: 46/46 tests and a fork demo.
+deployed to Arc Testnet, and verified: 52/52 tests and a fork demo.
 Mainnet deploy, demo flow, and video walkthrough are next; the
 submission closes Nov 1, 2026.
 
@@ -162,11 +172,17 @@ submission closes Nov 1, 2026.
 > A re-review (Oct 27, ~4:53 PM CDT) then found the gas check's 5,000
 > buffer did not cover the CALL's base cost — Claude, judgment sound;
 > Grok, no findings — so the buffer was raised to 40,000 with two
-> boundary tests (46/46 now pass). The repo contract therefore **no
-> longer matches the Studio build**; Studio must be updated and
-> re-verified to match before the mainnet deploy. The fork-demo and
-> mainnet-cost gas figures below are from the pre-revision contract and
-> will be re-measured when the fork demo is re-run.
+> boundary tests (46/46 then). A second re-review (Oct 27, ~5:22 PM CDT)
+> found two more Lows, both called optional — the rounding dust went to
+> a zero-share last recipient, and a credit to a contract with no
+> receive() was unrecoverable — so the dust now goes to the last
+> nonzero-share recipient, `withdrawTo()` was added, and the escrow
+> contract itself is rejected as payee/recipient (52/52 now pass).
+> The repo contract therefore **no longer matches the Studio build**;
+> Studio must be updated and re-verified to match before the mainnet
+> deploy. The fork-demo and mainnet-cost gas figures below are from the
+> pre-revision contract and will be re-measured when the fork demo is
+> re-run.
 
 ## Security notes / limits
 

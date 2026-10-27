@@ -26,7 +26,10 @@ pragma solidity ^0.8.24;
 ///   a direct payout capped at 100,000 gas; if that fails — the recipient is
 ///   a contract that reverts, or one that burns more gas than the cap — the
 ///   amount is credited to `pendingWithdrawals` instead and the recipient
-///   pulls it later with `withdraw()`. A payout never reverts the
+///   pulls it later with `withdraw()`, or to a different address with
+///   `withdrawTo()` (added Oct 27, 2026: a credit to a contract with no
+///   payable receive() can never be pulled to itself, so withdrawTo() is
+///   the only recovery path). A payout never reverts the
 ///   settlement, so a broken payee can never grief-block a release.
 /// @dev REVISED after independent review (Oct 27, 2026): this file NO LONGER
 ///   matches the Arc Studio build. The review found that deliver() had no
@@ -45,7 +48,7 @@ pragma solidity ^0.8.24;
 ///   "Deadline not reached", "Review period not ended", "Payment failed",
 ///   "Nothing to withdraw", "Insufficient gas for payout",
 ///   "Invalid recipient count", "Length mismatch", "Zero recipient",
-///   "Invalid share", "Invalid shares total", and "Use createEscrow or splitPayment".
+///   "Invalid recipient", "Invalid share", "Invalid shares total", and "Use createEscrow or splitPayment".
 ///   Solidity's checked arithmetic also retains its standard panic behavior.
 contract LamplightEscrow {
     struct Escrow {
@@ -109,7 +112,7 @@ contract LamplightEscrow {
     /// @param deadline Earliest timestamp for a refund if work has not been delivered.
     /// @return id The newly created escrow identifier, starting at zero.
     function createEscrow(address payee, uint256 deadline) external payable returns (uint256 id) {
-        require(payee != address(0) && payee != msg.sender, "Invalid payee");
+        require(payee != address(0) && payee != msg.sender && payee != address(this), "Invalid payee");
         require(msg.value > 0, "Zero payment");
         require(deadline > block.timestamp, "Invalid deadline");
 
@@ -195,10 +198,28 @@ contract LamplightEscrow {
     /// @notice Withdraw all pending credits to the caller.
     /// @dev A failed payment reverts, preserving the caller's credit for a later attempt.
     function withdraw() external nonReentrant {
+        _withdrawTo(msg.sender);
+    }
+
+    /// @notice Withdraw all pending credits to a chosen address.
+    /// @dev Lets a credited party pull its credit to an address that can
+    ///   receive it. Without this, a credit to a contract with no payable
+    ///   receive() is stuck forever: withdraw() pays to the credited
+    ///   address itself, which always reverts with "Payment failed".
+    ///   Only the credited party may move its own credit.
+    /// @param to Destination address; must be nonzero.
+    function withdrawTo(address to) external nonReentrant {
+        require(to != address(0), "Zero recipient");
+        _withdrawTo(to);
+    }
+
+    /// @dev Shared withdraw logic: zero the credit first, then pay. A
+    ///   failed payment reverts the whole call, so the credit is restored.
+    function _withdrawTo(address to) internal {
         uint256 amount = pendingWithdrawals[msg.sender];
         require(amount > 0, "Nothing to withdraw");
         pendingWithdrawals[msg.sender] = 0;
-        (bool success, ) = msg.sender.call{value: amount}("");
+        (bool success, ) = to.call{value: amount}("");
         require(success, "Payment failed");
         emit Withdrawn(msg.sender, amount);
     }
@@ -211,7 +232,10 @@ contract LamplightEscrow {
     }
 
     /// @notice Split this call's native payment among one to five recipients, crediting failed payouts.
-    /// @dev Shares must total 10,000 basis points. The last recipient receives all rounding dust.
+    /// @dev Shares must total 10,000 basis points. The last recipient with a
+    ///   nonzero share receives all rounding dust; a zero-share recipient
+    ///   gets no call at all. The escrow contract itself can never be a
+    ///   recipient: a credit to it could never be withdrawn.
     /// @param recipients Nonzero recipient addresses, in payment order.
     /// @param sharesBps Corresponding shares in basis points; zero shares are allowed.
     function splitPayment(address[] calldata recipients, uint256[] calldata sharesBps)
@@ -225,10 +249,17 @@ contract LamplightEscrow {
         require(count == sharesBps.length, "Length mismatch");
 
         uint256 totalShares;
+        // lastNonZero is the index of the last recipient with a nonzero
+        // share — the dust goes to it, never to a zero-share recipient.
+        // There is always at least one nonzero share (totalShares == 10000),
+        // so lastNonZero always exists.
+        uint256 lastNonZero;
         for (uint256 i = 0; i < count; ++i) {
             require(recipients[i] != address(0), "Zero recipient");
+            require(recipients[i] != address(this), "Invalid recipient");
             require(sharesBps[i] <= 10000, "Invalid share");
             totalShares += sharesBps[i];
+            if (sharesBps[i] > 0) lastNonZero = i;
         }
         require(totalShares == 10000, "Invalid shares total");
 
@@ -236,7 +267,7 @@ contract LamplightEscrow {
         for (uint256 i = 0; i < count; ++i) {
             // Quotient/remainder decomposition equals floor(value * share / 10000)
             // without overflowing the intermediate product for large native values.
-            uint256 amount = i == count - 1
+            uint256 amount = i == lastNonZero
                 ? msg.value - paid
                 : (msg.value / 10000) * sharesBps[i]
                 + ((msg.value % 10000) * sharesBps[i]) / 10000;
