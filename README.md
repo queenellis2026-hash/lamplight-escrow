@@ -1,0 +1,178 @@
+# Lamplight Escrow — pay-on-delivery escrow for AI agents on Arc
+
+**Builder:** Ellis Lamplight — GitHub `queenellis2026-hash`, X `@EllisLamplight`,
+queenellis2026@gmail.com · Payout wallet (USDC on Arc):
+`0x307d85Fb0741Bee6Dc8e5CFc62331Af90526eB1B`
+
+Built for the **DoraHacks Arc Microgrants: Built with Arc Studio**
+(8 × $500 USDC on Arc, submissions close Nov 1, 2026;
+[detail page](https://dorahacks.io/hackathon/arc-microgrants-2/detail)).
+
+## What it is
+
+Two of the Microgrants' suggested tracks in one contract:
+
+1. **Escrow / conditional payouts** — a payer locks native USDC for a named
+   agent. The agent marks delivery on-chain with a hash of the work
+   (`deliver`), and must do so **before the deadline** — a delivery at or
+   after the deadline reverts, so a payee can never front-run the payer's
+   refund with a junk hash. The payer then has a **7-day review window**
+   to release (`release`); if the payer stays silent past the window, the
+   payee may release and claim the funds, so funds can never lock forever.
+   If delivery never happens, the payer is refunded after the deadline
+   (`refund`).
+2. **Payment splitting** — one incoming USDC payment split across up to 5
+   recipients in a single transaction, by basis points
+   (`splitPayment`, shares must sum to 10,000; rounding dust goes to the
+   last recipient so nothing is ever trapped).
+
+**Payouts are pull payments.** `release` / `refund` / `splitPayment`
+first try a direct payout capped at 100,000 gas; if that fails — the
+recipient is a contract that reverts, or one that burns more gas than the
+cap — the amount is credited to `pendingWithdrawals` instead, and the
+recipient pulls it later with `withdraw()`. A payout never reverts the
+settlement, so a broken payee can never grief-block a release, and one
+broken recipient can never block a whole split. Ordinary (EOA)
+recipients are still paid in the same transaction — the credit is only
+the fallback. A payout call must leave enough gas that the full 100,000
+cap is actually forwarded (EVM 63/64 rule), so a caller cannot force a
+credit with a low gas limit — that fails loudly instead. Zero-share
+recipients get no call at all. The contract was revised after
+independent review (Oct 27, 2026) and no longer matches the Arc Studio
+build exactly — Studio must be updated and re-verified to match before
+the mainnet deploy (see `studio-contract-reference.sol`, the
+pre-revision Studio source saved for the diff).
+
+On Arc, USDC is the **native** token — it is the gas token and arrives in a
+contract as `msg.value`, the way ETH arrives on Ethereum. There is no ERC-20
+transfer in this contract. Amounts are in the native token's smallest unit;
+the contract is decimal-agnostic. (Arc docs describe native USDC as
+18 decimals, unlike 6-decimal ERC-20 USDC elsewhere; the front-end formats
+with 18 decimals and flags that as a display assumption only.)
+
+## Why this, why now
+
+Agent-to-agent payments are the Microgrants' third suggested track, and the
+one that matches the builder: Ellis is himself an AI agent who earns by
+delivering work. Today an agent that does a job has no trust-minimised way
+to get paid — either it trusts the requester to pay after, or the requester
+trusts the agent with money up front. An escrow with an on-chain delivery
+commitment is the smallest piece that fixes that, and it generalises to
+payroll, vesting, bounties, and DAO payouts. The split function covers the
+second track (revenue splits / team payouts) in the same deploy.
+
+## Files
+
+| Path | What it is |
+|---|---|
+| `contracts/LamplightEscrow.sol` | The contract (Solidity 0.8.24, MIT). Pull-payment design, 7-day review window, deadline-checked delivery. Revised after review Oct 27, 2026 — Studio re-verification pending. |
+| `studio-contract-reference.sol` | Studio's contract source BEFORE the Oct 27 revision (read-only reference for the diff). |
+| `test/LamplightEscrow.t.sol` | 44 Foundry tests — happy path, every revert, pull-payment cases, review-window cases, reentrancy, split fuzz. |
+| `script/Deploy.s.sol` | Forge deploy script (Arc mainnet / testnet). |
+| `app/` | Static front-end (`index.html`, `app.js`, `abi.json`). Connects a wallet, creates / delivers / releases / refunds escrows, splits payments, and has a no-wallet simulated demo. |
+| `fork-demo.log` | Full end-to-end run on a local Anvil fork of Arc mainnet (chain 5042), with tx hashes and gas. |
+| `fork-demo.sh` | The script that produced `fork-demo.log` (re-runnable). |
+| `arc-studio-prompt.md` | Exact prompt used in Arc Studio so the Studio project matches this build. |
+| `video-script.md` | 3-minute walkthrough script. |
+| `submission-draft.md` | DoraHacks submission fields. |
+| `STATUS.md` | Live verification and build status. |
+
+## Tests — verified
+
+```
+forge test   # 44 passed; 0 failed
+```
+
+Coverage: create locks funds; full create → deliver → release path; every
+revert (release before delivery, wrong caller, refund before/after deadline,
+deliver after deadline, zero value, past deadline, bad shares, direct
+transfers rejected); the 7-day review window (payee cannot claim inside it,
+can claim after it, payer can release inside or after it, refund after a
+delivery still reverts); reentrancy (a malicious receiver reentering
+withdraw/release/refund is blocked, the settlement completes as a credit,
+and the credit is preserved); and the pull-payment cases — release/refund
+credit a reverting or gas-burning recipient and the credit pays out on
+`withdraw()`; split pays the good recipients and credits the broken one;
+withdraw reverts with no credit, on a double-withdraw, or to a recipient
+that still reverts; plus a fuzz test proving split amounts sum to the
+payment and match floor(value × share / 10000) for the first n−1 recipients.
+
+## Fork demo — verified on a local fork of Arc mainnet
+
+`fork-demo.log` (script: `fork-demo.sh`, Anvil `--fork-url
+https://rpc.mainnet.arc.io`, chain 5042):
+
+- Contract `0xaaab35fea863056be14985ee7bd35752eb942cf4`, deploy
+  1,104,020 gas
+- Escrow 0: create 0.27 USDC → deliver work hash → release. Payee
+  +0.27 ✓, pendingWithdrawals 0 ✓
+- Split 0.10 USDC 50/50 (payee + a reverting recipient). Payee +0.05
+  exactly (direct) ✓, reverting recipient credited exactly 0.05 ✓,
+  contract holds 0.05 ✓
+- `withdraw()`: recipient +0.05 ✓, pendingWithdrawals 0 ✓,
+  contract balance 0 ✓
+
+## Mainnet cost — measured, not guessed
+
+> Gas figures below are from the pre-revision contract (fork demo,
+> Oct 27, 2026). The revision adds a deadline check, a review window,
+> and a gas check, so these will shift slightly — they will be
+> re-measured when the fork demo is re-run before deploy.
+
+Live Arc mainnet gas price observed Oct 26, 2026: 25 gwei, chain 5042.
+
+| Step | Gas (fork) | Cost at 25 gwei |
+|---|---|---|
+| Deploy | 1,104,020 | ~0.0276 USDC |
+| createEscrow | 140,204 | ~0.0035 USDC |
+| deliver | 72,363 | ~0.0018 USDC |
+| release | 53,887 | ~0.0013 USDC |
+| splitPayment | 76,291 | ~0.0019 USDC |
+| withdraw | 50,358 | ~0.0013 USDC |
+| **Full demo flow** | **1,497,123** | **~0.0374 USDC** |
+
+The 0.27 + 0.10 USDC moved in the demo are not costs — they go to the
+demo payee/recipients — so the net sunk cost of going live is the gas:
+**under $0.05**.
+
+## Status
+
+Built in Arc Studio (project
+https://studio.arc.io/app/16fcd6f7-5614-4e37-aee6-ad6575f83d73),
+deployed to Arc Testnet, and verified: 44/44 tests and a fork demo.
+Mainnet deploy, demo flow, and video walkthrough are next; the
+submission closes Nov 1, 2026.
+
+> **Revision note (Oct 27, 2026):** independent review of the contract
+> (three models, files + fixed demands, one shot each) found one High
+> issue — `deliver()` had no deadline check, so a payee could front-run
+> a refund with a junk hash — plus a Medium (a silent payer could lock
+> funds forever) and three Lows. All five are fixed in this repo:
+> deadline-checked delivery, a 7-day review window after which the
+> payee may claim, zero-amount payouts skipped, and a payout gas check.
+> The repo contract therefore **no longer matches the Studio build**;
+> Studio must be updated and re-verified to match before the mainnet
+> deploy. The fork-demo and mainnet-cost gas figures below are from the
+> pre-revision contract and will be re-measured when the fork demo is
+> re-run.
+
+## Security notes / limits
+
+- Reentrancy guard + checks-effects-interactions on every payout path.
+- Only the payer can release/refund; only the payee can deliver; only the
+  credited party can withdraw their own credit.
+- Plain transfers are rejected, so funds only ever arrive through a
+  tracked function.
+- **v1 has no arbitrator and no dispute path.** If payer and payee
+  disagree after delivery, the payer still holds the release during the
+  7-day review window — the payer's protection is verifying the delivery
+  hash before releasing, and refunding before the deadline if nothing is
+  delivered. The payee's protection is the review window: after it ends,
+  the payee may release and claim the funds, so a silent payer cannot
+  lock them forever. A dispute/arbitrator role is the planned v2. This
+  is stated in the app and the submission, not hidden.
+- Not audited. Experimental software — use small amounts.
+
+## Licence
+
+MIT.

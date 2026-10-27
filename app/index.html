@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lamplight Escrow — pay-on-delivery USDC escrow for AI agents on Arc</title>
+<meta name="description" content="Lamplight Escrow locks native USDC on Arc for an AI agent's work, releases it on delivery, refunds it if the work never comes. Built for the DoraHacks Arc Microgrants.">
+<style>
+  :root { --ink:#1c1a17; --paper:#fdf8ef; --amber:#f5b942; --arc:#2563eb; --ok:#15803d; --bad:#b91c1c; --line:#e5dcc8; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,"Segoe UI",sans-serif; background:var(--paper); color:var(--ink); line-height:1.5; }
+  header { background:#1c1a17; color:#fdf8ef; padding:2.2rem 1.2rem 1.6rem; }
+  header h1 { margin:0 0 .3rem; font-size:1.9rem; }
+  header h1 span { color:var(--amber); }
+  header p { margin:.2rem 0; max-width:44rem; opacity:.92; }
+  .wrap { max-width:46rem; margin:0 auto; padding:0 1.2rem 3rem; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:12px; padding:1.1rem 1.2rem; margin:1rem 0; }
+  .card h2 { margin:.1rem 0 .6rem; font-size:1.15rem; }
+  label { display:block; font-size:.85rem; font-weight:600; margin:.55rem 0 .15rem; }
+  input, select { width:100%; padding:.55rem .6rem; border:1px solid #c9c2ae; border-radius:8px; font:inherit; }
+  button { cursor:pointer; border:0; border-radius:8px; padding:.6rem 1rem; font:inherit; font-weight:700; background:var(--arc); color:#fff; margin-top:.7rem; }
+  button.secondary { background:#e8e2d2; color:var(--ink); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:.7rem; }
+  .mono { font-family:ui-monospace,Menlo,monospace; font-size:.82rem; word-break:break-all; }
+  .status { font-size:.9rem; }
+  .ok { color:var(--ok); font-weight:700; }
+  .bad { color:var(--bad); font-weight:700; }
+  .demo { background:#fff7dd; border:1px dashed #d9a514; }
+  .pill { display:inline-block; background:var(--amber); color:#1c1a17; border-radius:999px; padding:.1rem .6rem; font-size:.8rem; font-weight:700; }
+  table { width:100%; border-collapse:collapse; font-size:.9rem; }
+  td, th { text-align:left; padding:.35rem .3rem; border-bottom:1px solid var(--line); vertical-align:top; }
+  footer { font-size:.85rem; opacity:.75; padding:1rem 0 2rem; }
+  a { color:var(--arc); }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap" style="padding-bottom:0">
+    <h1>🕯️ Lamplight <span>Escrow</span></h1>
+    <p>Pay-on-delivery escrow for AI agents, on Arc. A requester locks native USDC for an agent's work. The agent marks delivery on-chain with a hash of the work. The requester releases — or gets refunded after the deadline if the work never comes. One payment can also be split across up to 5 recipients in a single transaction.</p>
+    <p><span class="pill">DoraHacks Arc Microgrants</span> &nbsp; <span class="pill">Built with Arc Studio</span></p>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="card" id="netcard">
+    <h2>1 · Network &amp; contract</h2>
+    <p class="status" id="netstatus">Not connected. This app talks to Arc — USDC is the native gas token there, so no other token is needed for fees.</p>
+    <div class="row">
+      <div>
+        <label for="network">Network</label>
+        <select id="network">
+          <option value="mainnet">Arc Mainnet — chain 5042</option>
+          <option value="testnet">Arc Testnet — chain 5042002</option>
+        </select>
+      </div>
+      <div>
+        <label for="contract">Contract address</label>
+        <input id="contract" class="mono" placeholder="0x… (set after mainnet deploy)">
+      </div>
+    </div>
+    <button id="connect">Connect wallet</button>
+    <button class="secondary" id="addnet">Add Arc network to wallet</button>
+    <p class="status" id="walletline"></p>
+  </div>
+
+  <div class="card">
+    <h2>2 · Create an escrow</h2>
+    <label for="payee">Payee — the agent / service being paid</label>
+    <input id="payee" class="mono" placeholder="0x…">
+    <div class="row">
+      <div>
+        <label for="amount">Amount (USDC)</label>
+        <input id="amount" type="number" min="0" step="0.01" placeholder="0.27">
+      </div>
+      <div>
+        <label for="days">Deadline (days from now)</label>
+        <input id="days" type="number" min="1" step="1" value="7">
+      </div>
+    </div>
+    <button id="create">Lock USDC in escrow</button>
+    <p class="status" id="createline"></p>
+  </div>
+
+  <div class="card">
+    <h2>3 · Deliver, release, refund</h2>
+    <label for="escrowId">Escrow ID</label>
+    <input id="escrowId" type="number" min="0" step="1" value="0">
+    <label for="workhash">Work hash — keccak256 of the deliverable (payee only)</label>
+    <input id="workhash" class="mono" placeholder="0x… or plain text (hashed for you)">
+    <button id="deliver">Mark delivered</button>
+    <button id="release" class="secondary">Release to payee</button>
+    <button id="refund" class="secondary">Refund to payer</button>
+    <p class="status" id="actionline"></p>
+    <button id="lookup" class="secondary">Look up this escrow</button>
+    <div id="escrowout" class="mono" style="margin-top:.6rem"></div>
+  </div>
+
+  <div class="card">
+    <h2>4 · Split one payment</h2>
+    <p>Split a single USDC payment across recipients by basis points (must sum to 10,000). Rounding dust goes to the last recipient, so nothing is ever trapped in the contract.</p>
+    <label for="splitAddrs">Recipient addresses (one per line)</label>
+    <input id="splitAddrs" class="mono" placeholder="0x…&#10;0x…">
+    <label for="splitShares">Shares in basis points (one per line, e.g. 5000 / 5000)</label>
+    <input id="splitShares" class="mono" placeholder="5000&#10;5000">
+    <label for="splitAmount">Total amount (USDC)</label>
+    <input id="splitAmount" type="number" min="0" step="0.01" placeholder="0.10">
+    <button id="split">Split payment</button>
+    <p class="status" id="splitline"></p>
+  </div>
+
+  <div class="card demo">
+    <h2>▶ Demo mode — no wallet needed</h2>
+    <p>Try the full flow with simulated data first: create → deliver → release, then a split. <b>Nothing here touches a chain.</b></p>
+    <button id="rundemo" class="secondary">Run simulated demo</button>
+    <table id="demotable" style="margin-top:.7rem">
+      <tr><th>Step</th><th>What happens</th><th>Result</th></tr>
+      <tr><td>1 · Create</td><td>Payer locks 0.27 USDC for the agent, deadline +7 days</td><td id="d1">—</td></tr>
+      <tr><td>2 · Deliver</td><td>Agent commits work hash <span class="mono">0xef5be0…fed72</span></td><td id="d2">—</td></tr>
+      <tr><td>3 · Release</td><td>Payer releases 0.27 USDC to the agent</td><td id="d3">—</td></tr>
+      <tr><td>4 · Split</td><td>0.10 USDC split 50/50 to two recipients</td><td id="d4">—</td></tr>
+    </table>
+    <p class="status">The same flow was run for real on a local fork of Arc mainnet during development — contract, transactions and gas are recorded in the repo's <span class="mono">fork-demo.log</span>. The live mainnet run is pending a small amount of real USDC on Arc (see status below).</p>
+  </div>
+
+  <div class="card">
+    <h2>How it works, in 30 seconds</h2>
+    <table>
+      <tr><td><b>Escrow</b></td><td><span class="mono">createEscrow(payee, deadline) payable</span> → <span class="mono">deliver(id, workHash)</span> → <span class="mono">release(id)</span> · or <span class="mono">refund(id)</span> after the deadline if undelivered.</td></tr>
+      <tr><td><b>Split</b></td><td><span class="mono">splitPayment(recipients, sharesBps) payable</span> — shares sum to 10,000 bps; last recipient takes rounding dust.</td></tr>
+      <tr><td><b>Safety</b></td><td>Reentrancy guard; checks-effects-interactions; only payer can release/refund; only payee can deliver; plain transfers are rejected so funds always arrive through a tracked function; 14 Foundry tests pass.</td></tr>
+      <tr><td><b>Limits (v1)</b></td><td>No arbitrator — if payer and payee disagree after delivery, the payer still holds the release. A dispute role is the next version.</td></tr>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Status</h2>
+    <p class="status" id="deployStatus">Mainnet deployment: <b>pending</b> — the contract is written, tested (14/14 Foundry tests), and proven on a local fork of Arc mainnet. Deploying to Arc mainnet needs a small amount of real USDC on Arc for gas (about $0.04 at the gas price observed Oct 26, 2026); the builder wallet currently holds 0. The moment it is funded, the deploy + demo transaction take minutes, and this page will show the live contract address and explorer links.</p>
+    <p>Builder: <b>Ellis Lamplight</b> — <a href="https://github.com/queenellis2026-hash">GitHub queenellis2026-hash</a> · <a href="https://x.com/EllisLamplight">X @EllisLamplight</a> · queenellis2026@gmail.com<br>
+    Payout wallet (USDC on Arc): <span class="mono">0x307d85Fb0741Bee6Dc8e5CFc62331Af90526eB1B</span><br>
+    Repo: public — link added at submission time. · Contract: <span class="mono">contracts/LamplightEscrow.sol</span> (MIT).</p>
+  </div>
+
+  <footer>Built with Arc Studio (contracts, tests and app) for the DoraHacks Arc Microgrants, Nov 1, 2026. Not audited — experimental software, use small amounts. Lamplight Escrow keeps full ownership with its builder; no equity, no IP assignment.</footer>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/ethers@6.13.0/dist/ethers.umd.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
