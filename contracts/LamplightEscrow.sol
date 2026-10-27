@@ -13,17 +13,28 @@ pragma solidity ^0.8.24;
 ///      may release and claim the funds. If delivery never happens, the
 ///      payer is refunded after the deadline. If the payer rejects a
 ///      delivery inside the review window, the payee has a bounded cure
-///      window to re-deliver a corrected hash; if it does not cure in time,
-///      the payer may refund. No third-party arbitrator in v1 — that is
-///      a stated limitation, not an oversight (see README).
+///      window to re-deliver a corrected hash — even past the deadline —
+///      and only inside that window; if it does not cure in time, the
+///      payer may refund via refundAfterRejection(). A rejected escrow
+///      can never take the plain refund() path, so a payer cannot reject
+///      a valid delivery after the deadline and refund immediately. A
+///      rejection may happen at most ONCE per escrow: a second rejection
+///      reverts, so a payer cannot reject every cured delivery in turn.
+///      The payer may also extend an undelivered escrow's deadline once,
+///      by at most 7 days, before delivery. No third-party arbitrator in
+///      v1 — that is a stated limitation, not an oversight (see README).
 ///   2. Payment splitting — one incoming USDC payment split across up to 5
 ///      recipients in a single transaction, by basis points.
-/// @dev Storage is packed: the Escrow struct fits in 5 slots (was 8) —
-///   amount is uint96, deadline / deliveredAt / rejectedAt are uint64, and
-///   "delivered" is deliveredAt != 0 rather than a separate bool. Amounts
-///   above 2**96 wei (~7.9e10 native token) revert in createEscrow; a
-///   deadline past 2**64 seconds (~5.8e11 years) is likewise rejected.
-///   Rejection state is rejectedAt != 0; a cured re-delivery clears it.
+/// @dev Storage is packed: the Escrow struct fits in 4 slots (was 8) —
+///   amount is uint96, deadline / deliveredAt / rejectedAt are uint40,
+///   and "delivered" is deliveredAt != 0 rather than a separate bool.
+///   rejectedOnce caps rejections at one per escrow, deadlineExtended
+///   caps the deadline extension at one use. Amounts above 2**96 wei
+///   (~7.9e10 native token) revert in createEscrow; a deadline past
+///   2**40 seconds (~year 34828) is likewise rejected. Timestamps are
+///   uint40 because no escrow deadline can ever approach 2**40 seconds.
+///   Rejection state is rejectedAt != 0; a cured re-delivery clears it
+///   (rejectedOnce stays set).
 /// @dev Arc note: on Arc, USDC is the NATIVE token — it is the gas token and
 ///   it arrives in a contract as msg.value, exactly the way ETH arrives on
 ///   Ethereum. There is no ERC-20 transfer in this contract. Amounts are in
@@ -52,11 +63,13 @@ pragma solidity ^0.8.24;
 ///   pre-revision reference copy at studio-contract-reference.sol).
 ///   Revert strings are used consistently for validation and failed withdrawals:
 ///   "Reentrant call", "Invalid payee", "Zero payment", "Amount too large",
-///   "Invalid deadline", "Escrow not found", "Only payee", "Only payer",
+///   "Invalid deadline", "Invalid extension", "Deadline already extended",
+///   "Escrow not found", "Only payee", "Only payer",
 ///   "Already settled", "Already delivered", "Already rejected",
 ///   "Empty work hash", "Deadline passed", "Not delivered", "Not rejected",
 ///   "Deadline not reached", "Review period not ended", "Review period ended",
-///   "Cure period not ended", "Payment failed", "Nothing to withdraw",
+///   "Cure period not ended", "Cure period ended", "Payment failed",
+///   "Nothing to withdraw",
 ///   "Insufficient gas for payout", "Invalid recipient count",
 ///   "Length mismatch", "Zero recipient", "Invalid recipient",
 ///   "Invalid share", "Invalid shares total", and "Use createEscrow or splitPayment".
@@ -65,14 +78,17 @@ contract LamplightEscrow {
     struct Escrow {
         address payer; // slot 0
         address payee; // slot 1
-        // slot 2 (232 of 256 bits): amount + deadline + deliveredAt + settled.
+        // slot 2 (240 of 256 bits): amount + deadline + deliveredAt +
+        //   rejectedAt + settled + rejectedOnce + deadlineExtended.
         // delivered == (deliveredAt != 0); there is no separate bool.
         uint96 amount;
-        uint64 deadline;
-        uint64 deliveredAt;
+        uint40 deadline;
+        uint40 deliveredAt;
+        uint40 rejectedAt;
         bool settled;
+        bool rejectedOnce; // a rejection already happened; caps rejections at one
+        bool deadlineExtended; // the one-time deadline extension was used
         bytes32 workHash; // slot 3
-        uint64 rejectedAt; // slot 4; 0 = not rejected
     }
 
     mapping(uint256 => Escrow) public escrows;
@@ -107,6 +123,12 @@ contract LamplightEscrow {
     ///   40,000 covers the worst-case CALL base cost with margin.
     uint256 private constant PAYOUT_GAS_BUFFER = 40_000;
 
+    /// @dev Max one-time deadline extension (see extendDeadline): 7 days.
+    ///   Bounded and once-only so an extension can never reopen the
+    ///   front-run hole the deadline rule closes — it cannot be called
+    ///   after delivery, and the increase is capped.
+    uint256 public constant MAX_DEADLINE_EXTENSION = 7 days;
+
     event EscrowCreated(
         uint256 indexed id,
         address indexed payer,
@@ -116,6 +138,7 @@ contract LamplightEscrow {
     );
     event Delivered(uint256 indexed id, bytes32 workHash);
     event DeliveryRejected(uint256 indexed id, address indexed payer);
+    event DeadlineExtended(uint256 indexed id, uint256 newDeadline);
     event Released(uint256 indexed id, address indexed payee, uint256 amount);
     event Refunded(uint256 indexed id, address indexed payer, uint256 amount);
     event SplitPaid(address indexed payer, uint256 total, uint256 recipientCount);
@@ -131,7 +154,7 @@ contract LamplightEscrow {
 
     /// @notice Fund an escrow for a distinct, nonzero payee and a future deadline.
     /// @dev Amounts above 2**96 wei revert ("Amount too large"); deadlines
-    ///   past 2**64 seconds revert as "Invalid deadline". Both bounds are
+    ///   past 2**40 seconds revert as "Invalid deadline". Both bounds are
     ///   far above any real escrow and exist only so the packed struct
     ///   can never truncate a value.
     /// @param payee Recipient entitled to deliver work and receive a released payment.
@@ -141,29 +164,39 @@ contract LamplightEscrow {
         require(payee != address(0) && payee != msg.sender && payee != address(this), "Invalid payee");
         require(msg.value > 0, "Zero payment");
         require(msg.value <= type(uint96).max, "Amount too large");
-        require(deadline > block.timestamp && deadline <= type(uint64).max, "Invalid deadline");
+        require(deadline > block.timestamp && deadline <= type(uint40).max, "Invalid deadline");
 
         id = nextEscrowId;
         escrows[id] = Escrow({
             payer: msg.sender,
             payee: payee,
             amount: uint96(msg.value),
-            deadline: uint64(deadline),
+            deadline: uint40(deadline),
             workHash: bytes32(0),
             deliveredAt: 0,
             settled: false,
-            rejectedAt: 0
+            rejectedAt: 0,
+            rejectedOnce: false,
+            deadlineExtended: false
         });
         nextEscrowId = id + 1;
         emit EscrowCreated(id, msg.sender, payee, msg.value, deadline);
     }
 
     /// @notice Record delivery once, as the payee of an unsettled escrow,
-    ///   before its deadline.
-    /// @dev A delivery at or after the deadline reverts: without this, a
-    ///   payee could deliver a junk hash as the deadline passes and kill
-    ///   the payer's refund. A re-delivery after a rejection is the cure:
-    ///   it clears the rejection and starts a fresh review window.
+    ///   before its deadline — or, after a rejection, as a cure inside the
+    ///   cure window even past the deadline.
+    /// @dev A fresh delivery at or after the deadline reverts: without
+    ///   this, a payee could deliver a junk hash as the deadline passes
+    ///   and kill the payer's refund. A re-delivery after a rejection is
+    ///   the cure: it clears the rejection and starts a fresh review
+    ///   window. The cure is bounded by rejectedAt + REJECT_CURE_PERIOD,
+    ///   NOT by the deadline — a rejected delivery's deadline has already
+    ///   passed by definition in the case the cure exists for, so the
+    ///   deadline must not gate it. After the cure window ends the
+    ///   delivery is dead and the payer's refundAfterRejection is the
+    ///   only exit; a late cure reverts so the payee can never front-run
+    ///   that refund with a junk hash and a fresh review window.
     /// @param id Existing escrow identifier.
     /// @param workHash Nonzero commitment to the delivered work.
     function deliver(uint256 id, bytes32 workHash) external {
@@ -172,11 +205,18 @@ contract LamplightEscrow {
         require(msg.sender == escrow.payee, "Only payee");
         require(!escrow.settled, "Already settled");
         require(escrow.deliveredAt == 0, "Already delivered");
-        require(block.timestamp < escrow.deadline, "Deadline passed");
+        if (escrow.rejectedAt != 0) {
+            require(
+                block.timestamp < escrow.rejectedAt + REJECT_CURE_PERIOD,
+                "Cure period ended"
+            );
+        } else {
+            require(block.timestamp < escrow.deadline, "Deadline passed");
+        }
         require(workHash != bytes32(0), "Empty work hash");
 
-        escrow.deliveredAt = uint64(block.timestamp);
-        escrow.rejectedAt = 0; // a cure clears the rejection
+        escrow.deliveredAt = uint40(block.timestamp);
+        escrow.rejectedAt = 0; // a cure clears the rejection (rejectedOnce stays set)
         escrow.workHash = workHash;
         emit Delivered(id, workHash);
     }
@@ -188,21 +228,25 @@ contract LamplightEscrow {
     ///   so a reject there reverts — the payee wins the boundary, mirroring
     ///   the release rule. A rejection clears the delivery (deliveredAt
     ///   and workHash go back to zero) and starts the cure clock: the
-    ///   payee may re-deliver a corrected hash before the escrow deadline
-    ///   and within REJECT_CURE_PERIOD; if it does not, the payer may
-    ///   refund via refundAfterRejection(). The rejected hash stays on
-    ///   record in the Delivered event.
+    ///   payee may re-deliver a corrected hash within REJECT_CURE_PERIOD
+    ///   (even past the deadline); if it does not, the payer may refund
+    ///   via refundAfterRejection(). The rejected hash stays on record in
+    ///   the Delivered event. Rejections are capped at ONE per escrow
+    ///   (rejectedOnce): a cured delivery cannot be rejected again, so a
+    ///   payer cannot reject every cured delivery in turn and the payee's
+    ///   cure is real protection, not a treadmill.
     /// @param id Existing, delivered, unsettled escrow identifier.
     function rejectDelivery(uint256 id) external nonReentrant {
         Escrow storage escrow = escrows[id];
         require(escrow.payer != address(0), "Escrow not found");
         require(msg.sender == escrow.payer, "Only payer");
         require(!escrow.settled, "Already settled");
-        require(escrow.rejectedAt == 0, "Already rejected");
+        require(!escrow.rejectedOnce, "Already rejected");
         require(escrow.deliveredAt != 0, "Not delivered");
         require(block.timestamp < escrow.deliveredAt + REVIEW_PERIOD, "Review period ended");
 
-        escrow.rejectedAt = uint64(block.timestamp);
+        escrow.rejectedOnce = true;
+        escrow.rejectedAt = uint40(block.timestamp);
         escrow.deliveredAt = 0;
         escrow.workHash = bytes32(0);
         emit DeliveryRejected(id, msg.sender);
@@ -257,6 +301,12 @@ contract LamplightEscrow {
 
     /// @notice Refund an undelivered escrow to its payer at or after its deadline.
     /// @dev A failed payout credits the payer for withdrawal; the escrow remains settled.
+    ///   A rejected escrow can NEVER take this path (rejectedAt != 0
+    ///   reverts "Already rejected"): without this, a payer could reject
+    ///   a valid delivery after the deadline — the rejection clears
+    ///   deliveredAt — and refund immediately, taking back paid-for work
+    ///   with no cure possible. Rejected escrows exit only through
+    ///   refundAfterRejection(), after the cure window ends.
     /// @param id Existing, undelivered, unsettled escrow identifier.
     function refund(uint256 id) external nonReentrant {
         Escrow storage escrow = escrows[id];
@@ -264,11 +314,40 @@ contract LamplightEscrow {
         require(msg.sender == escrow.payer, "Only payer");
         require(!escrow.settled, "Already settled");
         require(escrow.deliveredAt == 0, "Already delivered");
+        require(escrow.rejectedAt == 0, "Already rejected");
         require(block.timestamp >= escrow.deadline, "Deadline not reached");
 
         escrow.settled = true;
         _payOrCredit(escrow.payer, escrow.amount);
         emit Refunded(id, escrow.payer, escrow.amount);
+    }
+
+    /// @notice Extend an undelivered escrow's deadline once, by at most 7 days.
+    /// @dev Only the payer, only before delivery, only once, and only by a
+    ///   bounded amount (MAX_DEADLINE_EXTENSION). It cannot reopen the
+    ///   front-run hole: after delivery the deadline no longer gates
+    ///   anything (a delivered escrow exits through release, never
+    ///   refund), and the increase is capped so a payer cannot push the
+    ///   deadline out indefinitely. It also cannot be used on a rejected
+    ///   escrow — the cure window, not the deadline, is the binding clock
+    ///   there. The new deadline must still fit the packed uint40 field.
+    /// @param id Existing, undelivered, unsettled escrow identifier.
+    /// @param extraSeconds Seconds to add to the deadline (1 .. 7 days).
+    function extendDeadline(uint256 id, uint256 extraSeconds) external nonReentrant {
+        Escrow storage escrow = escrows[id];
+        require(escrow.payer != address(0), "Escrow not found");
+        require(msg.sender == escrow.payer, "Only payer");
+        require(!escrow.settled, "Already settled");
+        require(escrow.deliveredAt == 0, "Already delivered");
+        require(escrow.rejectedAt == 0, "Already rejected");
+        require(!escrow.deadlineExtended, "Deadline already extended");
+        require(extraSeconds > 0 && extraSeconds <= MAX_DEADLINE_EXTENSION, "Invalid extension");
+        uint256 newDeadline = uint256(escrow.deadline) + extraSeconds;
+        require(newDeadline <= type(uint40).max, "Invalid deadline");
+
+        escrow.deadline = uint40(newDeadline);
+        escrow.deadlineExtended = true;
+        emit DeadlineExtended(id, newDeadline);
     }
 
     /// @notice Withdraw all pending credits to the caller.
@@ -305,6 +384,24 @@ contract LamplightEscrow {
     /// @return The escrow's complete stored fields.
     function getEscrow(uint256 id) external view returns (Escrow memory) {
         return escrows[id];
+    }
+
+    /// @notice The two timestamps that bound the review window and the cure
+    ///   window, so indexers and UIs never re-compute them.
+    /// @dev reviewEnd is the last second of the review window: the payee
+    ///   may claim from reviewEnd (release uses >=), and a reject at
+    ///   reviewEnd reverts. cureEnd is the last second of the cure window:
+    ///   the payee may cure before cureEnd, and the payer may refund after
+    ///   it (>=). Both are 0 when they do not apply (not delivered / not
+    ///   rejected), so a caller never mistakes an offset for a timestamp
+    ///   that has already passed.
+    /// @param id Escrow identifier to read.
+    /// @return reviewEnd deliveredAt + REVIEW_PERIOD, or 0 if not delivered
+    /// @return cureEnd rejectedAt + REJECT_CURE_PERIOD, or 0 if not rejected
+    function reviewWindows(uint256 id) external view returns (uint256 reviewEnd, uint256 cureEnd) {
+        Escrow storage escrow = escrows[id];
+        reviewEnd = escrow.deliveredAt == 0 ? 0 : uint256(escrow.deliveredAt) + REVIEW_PERIOD;
+        cureEnd = escrow.rejectedAt == 0 ? 0 : uint256(escrow.rejectedAt) + REJECT_CURE_PERIOD;
     }
 
     /// @notice Split this call's native payment among one to five recipients, crediting failed payouts.

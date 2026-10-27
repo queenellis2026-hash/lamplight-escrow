@@ -167,9 +167,11 @@ contract LamplightEscrowTest is Test {
     address payer = address(0xA11CE);
     address payee = address(0xBEEF);
     address third = address(0xCAFE);
+    FlakyRecipient flaky;
 
     function setUp() public {
         esc = new LamplightEscrow();
+        flaky = new FlakyRecipient();
         vm.deal(payer, 100 ether);
         vm.deal(payee, 1 ether);
         vm.deal(third, 1 ether);
@@ -1021,9 +1023,10 @@ contract LamplightEscrowTest is Test {
     // ---- Round 4 (Oct 27, 2026): struct packing ----
 
     function testPackedStructFieldsRoundTrip() public {
-        // The packed struct (uint96 amount, uint64 deadline/deliveredAt/
-        // rejectedAt, deliveredAt != 0 as the delivered flag) must read
-        // back exactly what createEscrow stored.
+        // The packed struct (uint96 amount, uint40 deadline/deliveredAt/
+        // rejectedAt, deliveredAt != 0 as the delivered flag, plus the
+        // rejectedOnce and deadlineExtended bools) must read back exactly
+        // what createEscrow stored.
         uint256 id = _create(0.5 ether, 1 days);
         LamplightEscrow.Escrow memory e = esc.getEscrow(id);
         assertEq(e.payer, payer);
@@ -1034,6 +1037,8 @@ contract LamplightEscrowTest is Test {
         assertEq(e.rejectedAt, 0);
         assertEq(e.workHash, bytes32(0));
         assertFalse(e.settled);
+        assertFalse(e.rejectedOnce);
+        assertFalse(e.deadlineExtended);
         // after delivery the packed fields update in place
         vm.prank(payee);
         esc.deliver(id, keccak256("x"));
@@ -1056,10 +1061,32 @@ contract LamplightEscrowTest is Test {
     }
 
     function testCreateEscrowDeadlineTooLargeReverts() public {
-        // A deadline past 2**64 seconds cannot fit the packed uint64 slot.
+        // A deadline past 2**40 seconds cannot fit the packed uint40 slot.
         vm.prank(payer);
         vm.expectRevert("Invalid deadline");
-        esc.createEscrow{value: 0.1 ether}(payee, uint256(type(uint64).max) + 1);
+        esc.createEscrow{value: 0.1 ether}(payee, uint256(type(uint40).max) + 1);
+    }
+
+    function testPackedStructRejectAndExtendFlagsRoundTrip() public {
+        // The two new bools round-trip: a rejection sets rejectedOnce (and
+        // it stays set after the cure clears rejectedAt), and an extension
+        // sets deadlineExtended with the new deadline.
+        uint256 id = _delivered(0.5 ether);
+        vm.prank(payer);
+        esc.rejectDelivery(id);
+        assertTrue(esc.getEscrow(id).rejectedOnce);
+        vm.prank(payee);
+        esc.deliver(id, keccak256("cured"));
+        assertTrue(esc.getEscrow(id).rejectedOnce); // stays set after cure
+        assertEq(esc.getEscrow(id).rejectedAt, 0);
+
+        uint256 id2 = _create(0.5 ether, 1 days);
+        uint256 oldDeadline = esc.getEscrow(id2).deadline;
+        vm.prank(payer);
+        esc.extendDeadline(id2, 2 days);
+        LamplightEscrow.Escrow memory e2 = esc.getEscrow(id2);
+        assertTrue(e2.deadlineExtended);
+        assertEq(e2.deadline, oldDeadline + 2 days);
     }
 
     // ---- Round 4: discriminating gas-guard tests (Claude improvement 1) ----
@@ -1368,22 +1395,360 @@ contract LamplightEscrowTest is Test {
         esc.refundAfterRejection(id);
     }
 
-    function testRejectThenCureThenRejectAgain() public {
-        // A cured delivery can be rejected again if the new hash is also
-        // junk — each rejection starts a fresh cure window.
+    function testSecondRejectionAfterCureReverts() public {
+        // Round 5 (Claude High, one-rejection cap): a cured delivery
+        // CANNOT be rejected again. The first rejection starts the cure;
+        // the cure clears rejectedAt but rejectedOnce stays set, so the
+        // second rejectDelivery reverts "Already rejected" — a payer
+        // cannot reject every cured delivery in turn.
         uint256 id = _delivered(0.5 ether);
         vm.prank(payer);
         esc.rejectDelivery(id);
         vm.prank(payee);
         esc.deliver(id, keccak256("work v2 still junk"));
         vm.prank(payer);
+        vm.expectRevert("Already rejected");
         esc.rejectDelivery(id);
-        assertEq(esc.getEscrow(id).rejectedAt, block.timestamp);
-        // and the second rejection can also be cured
-        vm.prank(payee);
-        esc.deliver(id, keccak256("work v3 good"));
+        // and the cured delivery still releases normally
         vm.prank(payer);
         esc.release(id);
         assertTrue(esc.getEscrow(id).settled);
+    }
+
+    // ---- Round 5 (Oct 27, 2026): reject/cure fixes (Claude High + Medium) ----
+
+    function testRejectedEscrowCannotTakePlainRefund() public {
+        // Claude High (round 5): the exact repro. Payee delivers at D-1;
+        // at D+1 (inside the 7-day review window) the payer rejects; the
+        // rejection clears deliveredAt, so the OLD refund() would have
+        // passed (deliveredAt == 0, now >= deadline) and taken back
+        // paid-for work with no cure possible. Now refund() reverts
+        // "Already rejected" and the only exit is refundAfterRejection
+        // after the cure window ends.
+        uint256 id = _create(0.5 ether, 1 days);
+        vm.warp(block.timestamp + 1 days - 1); // D-1
+        vm.prank(payee);
+        esc.deliver(id, keccak256("good work"));
+        vm.warp(block.timestamp + 2); // D+1, inside the review window
+        vm.prank(payer);
+        esc.rejectDelivery(id);
+        // plain refund() must NOT work on a rejected escrow
+        vm.prank(payer);
+        vm.expectRevert("Already rejected");
+        esc.refund(id);
+        // and the cure is still open: the payee can re-deliver past the
+        // deadline, inside the cure window (FIX A part 2)
+        vm.prank(payee);
+        esc.deliver(id, keccak256("work v2"));
+        assertEq(esc.getEscrow(id).deliveredAt, block.timestamp);
+        // a second escrow proves the refundAfterRejection exit still works
+        uint256 id2 = _create(0.5 ether, 1 days);
+        vm.prank(payee);
+        esc.deliver(id2, keccak256("work"));
+        vm.warp(block.timestamp + 1 days); // past the deadline, inside window
+        vm.prank(payer);
+        esc.rejectDelivery(id2);
+        vm.prank(payer);
+        vm.expectRevert("Already rejected");
+        esc.refund(id2);
+        vm.warp(block.timestamp + 3 days); // cure window over
+        uint256 before = payer.balance;
+        vm.prank(payer);
+        esc.refundAfterRejection(id2);
+        assertEq(payer.balance, before + 0.5 ether);
+        assertTrue(esc.getEscrow(id2).settled);
+    }
+
+    function testCureAfterCurePeriodReverts() public {
+        // Claude Medium (round 5): the cure window is enforced on the
+        // payee side. After rejectedAt + 3 days the payee can no longer
+        // re-deliver — even if the deadline has not passed — so a junk
+        // hash cannot front-run the payer's refundAfterRejection and buy
+        // a fresh 7-day review window.
+        uint256 id = _delivered(0.5 ether); // 30-day deadline
+        vm.prank(payer);
+        esc.rejectDelivery(id);
+        uint256 rejectedAt = esc.getEscrow(id).rejectedAt;
+        vm.warp(rejectedAt + 3 days - 1); // last second of the cure window
+        vm.prank(payee);
+        esc.deliver(id, keccak256("just in time"));
+        // and the boundary on a second escrow: at the cure end it reverts
+        uint256 id2 = _delivered(0.5 ether);
+        vm.prank(payer);
+        esc.rejectDelivery(id2);
+        uint256 rejectedAt2 = esc.getEscrow(id2).rejectedAt;
+        vm.warp(rejectedAt2 + 3 days); // exactly the cure end
+        vm.prank(payee);
+        vm.expectRevert("Cure period ended");
+        esc.deliver(id2, keccak256("too late"));
+        // and the payer's refundAfterRejection is now open
+        vm.prank(payer);
+        esc.refundAfterRejection(id2);
+        assertTrue(esc.getEscrow(id2).settled);
+    }
+
+    // ---- Round 5: reviewWindows view helper (Grok improvement 1) ----
+
+    function testReviewWindowsMatchesBehaviorAtBoundaries() public {
+        // Grok improvement (round 5): reviewWindows() mirrors HSK's
+        // claimWindows. Before delivery both are 0; after delivery the
+        // review end matches the release/reject boundary; after a
+        // rejection the cure end matches the cure/refund boundary.
+        uint256 id0 = _create(0.5 ether, 30 days);
+        (uint256 r0, uint256 c0) = esc.reviewWindows(id0);
+        assertEq(r0, 0);
+        assertEq(c0, 0);
+
+        uint256 id = _delivered(0.5 ether);
+        uint256 deliveredAt = esc.getEscrow(id).deliveredAt;
+        (uint256 reviewEnd, uint256 cureEnd) = esc.reviewWindows(id);
+        assertEq(reviewEnd, deliveredAt + 7 days);
+        assertEq(cureEnd, 0); // not rejected
+        // at the exact review end the payee may claim and the payer may
+        // not reject — the helper's value is the real boundary
+        vm.warp(reviewEnd);
+        vm.prank(payer);
+        vm.expectRevert("Review period ended");
+        esc.rejectDelivery(id);
+        vm.prank(payee);
+        esc.release(id);
+        assertTrue(esc.getEscrow(id).settled);
+
+        // cure end: reject, then the helper's cure end is the real boundary
+        uint256 id2 = _delivered(0.5 ether);
+        vm.prank(payer);
+        esc.rejectDelivery(id2);
+        (reviewEnd, cureEnd) = esc.reviewWindows(id2);
+        assertEq(reviewEnd, 0); // cleared by the rejection
+        uint256 rejectedAt = esc.getEscrow(id2).rejectedAt;
+        assertEq(cureEnd, rejectedAt + 3 days);
+        vm.warp(cureEnd - 1); // last second of the cure window
+        vm.prank(payee);
+        esc.deliver(id2, keccak256("cured in time"));
+        assertEq(esc.getEscrow(id2).rejectedAt, 0);
+    }
+
+    // ---- Round 5: extend deadline (Grok feature) ----
+
+    function testExtendDeadlineWorks() public {
+        uint256 id = _create(0.5 ether, 1 days);
+        uint256 oldDeadline = esc.getEscrow(id).deadline;
+        vm.prank(payer);
+        esc.extendDeadline(id, 2 days);
+        assertEq(esc.getEscrow(id).deadline, oldDeadline + 2 days);
+        // the payee can now deliver in the extended window
+        vm.warp(oldDeadline + 1 days); // past the ORIGINAL deadline
+        vm.prank(payee);
+        esc.deliver(id, keccak256("in the extension"));
+        assertEq(esc.getEscrow(id).deliveredAt, block.timestamp);
+    }
+
+    function testExtendDeadlineAfterDeliveryReverts() public {
+        uint256 id = _delivered(0.5 ether);
+        vm.prank(payer);
+        vm.expectRevert("Already delivered");
+        esc.extendDeadline(id, 1 days);
+    }
+
+    function testExtendDeadlineBeyondBoundReverts() public {
+        uint256 id = _create(0.5 ether, 1 days);
+        vm.prank(payer);
+        vm.expectRevert("Invalid extension");
+        esc.extendDeadline(id, 7 days + 1);
+        vm.prank(payer);
+        vm.expectRevert("Invalid extension");
+        esc.extendDeadline(id, 0);
+        // exactly 7 days works
+        vm.prank(payer);
+        esc.extendDeadline(id, 7 days);
+        assertEq(esc.getEscrow(id).deadline, block.timestamp + 1 days + 7 days);
+    }
+
+    function testExtendDeadlineOnlyOnce() public {
+        uint256 id = _create(0.5 ether, 1 days);
+        vm.prank(payer);
+        esc.extendDeadline(id, 1 days);
+        vm.prank(payer);
+        vm.expectRevert("Deadline already extended");
+        esc.extendDeadline(id, 1 days);
+    }
+
+    function testExtendDeadlineOnlyPayerAndNotWhileRejected() public {
+        uint256 id = _create(0.5 ether, 1 days);
+        vm.prank(payee);
+        vm.expectRevert("Only payer");
+        esc.extendDeadline(id, 1 days);
+        uint256 id2 = _delivered(0.5 ether);
+        vm.prank(payer);
+        esc.rejectDelivery(id2);
+        vm.prank(payer);
+        vm.expectRevert("Already rejected");
+        esc.extendDeadline(id2, 1 days);
+    }
+
+    // ---- Round 5: splitPayment fuzz, full uint96 range (Grok improvement 3) ----
+
+    function testSplitPaymentFuzzFullUint96(uint256 value, uint256 s0, uint256 s1) public {
+        // Grok improvement (round 5): sweep msg.value across the full
+        // uint96 range with random share vectors summing to 10,000.
+        // The contract balance must end at zero and the dust must always
+        // land on a non-zero-share recipient.
+        vm.assume(value > 0 && value <= type(uint96).max);
+        vm.assume(s0 <= 10000);
+        vm.assume(s1 <= 10000 - s0);
+        uint256 s2 = 10000 - s0 - s1;
+        address[] memory r = new address[](3);
+        r[0] = payee;
+        r[1] = third;
+        r[2] = payer;
+        uint256[] memory s = new uint256[](3);
+        s[0] = s0;
+        s[1] = s1;
+        s[2] = s2;
+        vm.deal(payer, value);
+        uint256 b0 = payee.balance;
+        uint256 b1 = third.balance;
+        uint256 b2 = payer.balance;
+        vm.prank(payer);
+        esc.splitPayment{value: value}(r, s);
+        assertEq(address(esc).balance, 0);
+        (uint256 e0, uint256 e1, uint256 e2) = _splitExpectations(value, s0, s1, s2);
+        assertEq(payee.balance, b0 + e0);
+        assertEq(third.balance, b1 + e1);
+        // payer sent `value` and received e2 back as the last recipient
+        assertEq(payer.balance, b2 + e2 - value);
+    }
+
+    // ---- Round 5: balance invariant + boundary tests (Claude improvement) ----
+
+    /// @dev The balance invariant: the contract holds exactly the sum of
+    ///   unsettled escrow amounts plus all outstanding pull credits.
+    ///   Every account that can hold a credit in this test is listed.
+    function _assertBalanceInvariant(uint256[] memory ids, uint256 count) internal view {
+        uint256 expected;
+        for (uint256 i = 0; i < count; ++i) {
+            LamplightEscrow.Escrow memory e = esc.getEscrow(ids[i]);
+            if (!e.settled) expected += e.amount;
+        }
+        expected += esc.pendingWithdrawals(payer);
+        expected += esc.pendingWithdrawals(payee);
+        expected += esc.pendingWithdrawals(third);
+        expected += esc.pendingWithdrawals(address(flaky));
+        assertEq(address(esc).balance, expected);
+    }
+
+    function testFuzzBalanceInvariant(uint256 seed) public {
+        // Claude improvement (round 5): fuzz over amounts and settlement
+        // paths; assert the balance invariant after every step. All
+        // escrows carry a 30-day deadline so the cure-window warps never
+        // pass a deadline; choice-3 (never deliver) escrows are refunded
+        // in a second pass, after one warp past all deadlines.
+        uint256 n = seed % 3 + 1; // 1..3 escrows
+        uint256[] memory ids = new uint256[](n);
+        uint256[] memory choices = new uint256[](n);
+        for (uint256 i = 0; i < n; ++i) {
+            uint256 amount = (uint256(keccak256(abi.encode(seed, "amt", i))) % 0.01 ether) + 1;
+            vm.prank(payer);
+            ids[i] = esc.createEscrow{value: amount}(payee, block.timestamp + 30 days);
+            choices[i] = uint256(keccak256(abi.encode(seed, "act", i))) % 4;
+            _assertBalanceInvariant(ids, i + 1);
+        }
+        for (uint256 i = 0; i < n; ++i) {
+            if (choices[i] == 3) continue; // refunded in the second pass
+            vm.prank(payee);
+            esc.deliver(ids[i], keccak256(abi.encode(seed, i)));
+            _assertBalanceInvariant(ids, n);
+            if (choices[i] == 0) {
+                // deliver then release
+                vm.prank(payer);
+                esc.release(ids[i]);
+            } else if (choices[i] == 1) {
+                // deliver, reject, cure, release
+                vm.prank(payer);
+                esc.rejectDelivery(ids[i]);
+                _assertBalanceInvariant(ids, n);
+                vm.prank(payee);
+                esc.deliver(ids[i], keccak256(abi.encode(seed, i, "cure")));
+                vm.prank(payer);
+                esc.release(ids[i]);
+            } else {
+                // deliver, reject, no cure, refund after the cure window
+                vm.prank(payer);
+                esc.rejectDelivery(ids[i]);
+                uint256 rejectedAt = esc.getEscrow(ids[i]).rejectedAt;
+                vm.warp(rejectedAt + 3 days);
+                vm.prank(payer);
+                esc.refundAfterRejection(ids[i]);
+            }
+            _assertBalanceInvariant(ids, n);
+        }
+        for (uint256 i = 0; i < n; ++i) {
+            if (choices[i] != 3) continue;
+            uint256 deadline = esc.getEscrow(ids[i]).deadline;
+            vm.warp(deadline + 1);
+            vm.prank(payer);
+            esc.refund(ids[i]);
+            _assertBalanceInvariant(ids, n);
+        }
+        // a split across the EOA payee, third, and the reverting flaky
+        // recipient — the flaky share credits, the good shares pay out
+        uint256 splitValue = (uint256(keccak256(abi.encode(seed, "split"))) % 0.01 ether) + 1;
+        uint256 s0 = uint256(keccak256(abi.encode(seed, "s0"))) % 10000;
+        uint256 s1 = uint256(keccak256(abi.encode(seed, "s1"))) % (10000 - s0);
+        uint256 s2 = 10000 - s0 - s1;
+        address[] memory r = new address[](3);
+        r[0] = payee;
+        r[1] = third;
+        r[2] = address(flaky);
+        uint256[] memory s = new uint256[](3);
+        s[0] = s0;
+        s[1] = s1;
+        s[2] = s2;
+        vm.prank(payer);
+        esc.splitPayment{value: splitValue}(r, s);
+        _assertBalanceInvariant(ids, n);
+        // pull the flaky credit out and the invariant still holds
+        flaky.setReverting(false);
+        flaky.withdrawFrom(payable(address(esc)));
+        _assertBalanceInvariant(ids, n);
+    }
+
+    function testDeadlineAndCureBoundaryEdges() public {
+        // Claude improvement (round 5): pin the edges. Deliver at
+        // deadline-1 succeeds; at the deadline it reverts. Cure at
+        // cure-end-1 succeeds; at the cure end it reverts. Refund after
+        // rejection at cure-end-1 reverts; at the cure end it succeeds.
+        uint256 id = _create(0.5 ether, 1 days);
+        vm.warp(block.timestamp + 1 days - 1); // deadline - 1
+        vm.prank(payee);
+        esc.deliver(id, keccak256("just in time"));
+        assertEq(esc.getEscrow(id).deliveredAt, block.timestamp);
+
+        uint256 id2 = _create(0.5 ether, 1 days);
+        vm.warp(block.timestamp + 1 days); // exactly the deadline
+        vm.prank(payee);
+        vm.expectRevert("Deadline passed");
+        esc.deliver(id2, keccak256("too late"));
+
+        uint256 id3 = _delivered(0.5 ether);
+        vm.prank(payer);
+        esc.rejectDelivery(id3);
+        uint256 rejectedAt = esc.getEscrow(id3).rejectedAt;
+        vm.warp(rejectedAt + 3 days - 1); // last second of the cure window
+        vm.prank(payee);
+        esc.deliver(id3, keccak256("cured in time"));
+
+        uint256 id4 = _delivered(0.5 ether);
+        vm.prank(payer);
+        esc.rejectDelivery(id4);
+        uint256 rejectedAt4 = esc.getEscrow(id4).rejectedAt;
+        vm.warp(rejectedAt4 + 3 days - 1);
+        vm.prank(payer);
+        vm.expectRevert("Cure period not ended");
+        esc.refundAfterRejection(id4);
+        vm.warp(rejectedAt4 + 3 days); // exactly the cure end
+        vm.prank(payer);
+        esc.refundAfterRejection(id4);
+        assertTrue(esc.getEscrow(id4).settled);
     }
 }

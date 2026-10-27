@@ -22,9 +22,15 @@ Two of the Microgrants' suggested tracks in one contract:
    If delivery never happens, the payer is refunded after the deadline
    (`refund`). If the payer rejects a delivery inside the review window
    (`rejectDelivery`), the payee has a **3-day cure window** to re-deliver
-   a corrected hash; if it does not cure in time, the payer may refund
-   (`refundAfterRejection`). A junk hash delivered just before the
-   deadline can no longer auto-pay after 7 days with no recourse.
+   a corrected hash — even past the deadline, but only inside the cure
+   window; if it does not cure in time, the payer may refund
+   (`refundAfterRejection`). A rejected escrow can never take the plain
+   `refund()` path, so a payer cannot reject a valid delivery after the
+   deadline and refund immediately. Rejections are capped at **one per
+   escrow**: a cured delivery cannot be rejected again. The payer may also
+   extend an undelivered escrow's deadline once, by at most 7 days
+   (`extendDeadline`, before delivery only). A junk hash delivered just
+   before the deadline can no longer auto-pay after 7 days with no recourse.
 2. **Payment splitting** — one incoming USDC payment split across up to 5
    recipients in a single transaction, by basis points
    (`splitPayment`, shares must sum to 10,000; rounding dust goes to the
@@ -79,9 +85,9 @@ second track (revenue splits / team payouts) in the same deploy.
 
 | Path | What it is |
 |---|---|
-| `contracts/LamplightEscrow.sol` | The contract (Solidity 0.8.24, MIT). Pull-payment design, 7-day review window, deadline-checked delivery, payer reject + 3-day cure window, packed storage (5 slots). Revised after review Oct 27, 2026 — Studio re-verification pending. |
+| `contracts/LamplightEscrow.sol` | The contract (Solidity 0.8.24, MIT). Pull-payment design, 7-day review window, deadline-checked delivery, payer reject + 3-day cure window (one rejection per escrow), one-time deadline extension (max 7 days), packed storage (4 slots). Revised after review Oct 27, 2026 — Studio re-verification pending. |
 | `studio-contract-reference.sol` | Studio's contract source BEFORE the Oct 27 revision (read-only reference for the diff). |
-| `test/LamplightEscrow.t.sol` | 67 Foundry tests — happy path, every revert, pull-payment cases, review-window cases, reentrancy, split fuzz, reject path, gas-guard sweep. |
+| `test/LamplightEscrow.t.sol` | 79 Foundry tests — happy path, every revert, pull-payment cases, review-window cases, reentrancy, split fuzz (full uint96 range), reject/cure path, gas-guard sweep, balance invariant, deadline extension. |
 | `script/Deploy.s.sol` | Forge deploy script (Arc mainnet / testnet). |
 | `app/` | Static front-end (`index.html`, `app.js`, `abi.json`). Connects a wallet, creates / delivers / releases / refunds escrows, splits payments, and has a no-wallet simulated demo. |
 | `fork-demo.log` | Full end-to-end run on a local Anvil fork of Arc mainnet (chain 5042), with tx hashes and gas. |
@@ -94,7 +100,7 @@ second track (revenue splits / team payouts) in the same deploy.
 ## Tests — verified
 
 ```
-forge test   # 67 passed; 0 failed
+forge test   # 79 passed; 0 failed
 ```
 
 Coverage: create locks funds; full create → deliver → release path; every
@@ -122,16 +128,28 @@ contract itself as payee/recipient (a credit to it could never be
 withdrawn); the `Credited` event is emitted only on the failed-push path,
 so an indexer distinguishes a pull credit from a direct payment by its
 presence in the same transaction as the settlement event; the packed
-struct reads back exactly (uint96 amount, uint64 timestamps,
-deliveredAt != 0 as the delivered flag), and oversized amounts/deadlines
-revert rather than truncate; plus a fuzz test proving split amounts sum to the
-payment, every recipient except the last nonzero-share one gets exactly
-floor(value × share / 10000), the last nonzero-share one takes the dust,
-and a zero-share recipient gets nothing; plus the reject path — reject
-inside the window then cure then release, reject after the window reverts,
+struct reads back exactly (uint96 amount, uint40 timestamps,
+deliveredAt != 0 as the delivered flag, plus the rejectedOnce and
+deadlineExtended bools), and oversized amounts/deadlines revert rather
+than truncate (createEscrow gas 129,991 → 129,780 after the uint40
+shrink — the eliminated slot held a zero value, so the saving is small;
+the gain is one fewer cold SLOAD on the reject/cure paths); plus a fuzz
+test proving split amounts sum to the payment, every recipient except the
+last nonzero-share one gets exactly floor(value × share / 10000), the
+last nonzero-share one takes the dust, and a zero-share recipient gets
+nothing — and a second fuzz sweeping msg.value across the full uint96
+range with random share vectors; plus the reject path — reject inside
+the window then cure then release, reject after the window reverts,
 uncured rejection refunds after the 3-day cure window (and reverts before
-it), reject of an undelivered escrow reverts, double-reject reverts, and
-a cured delivery can be rejected again.
+it), reject of an undelivered escrow reverts, double-reject reverts, a
+cured delivery can NOT be rejected again (one-rejection cap), a rejected
+escrow cannot take the plain refund() path, a cure after the cure window
+reverts, a cure past the deadline inside the cure window succeeds, and
+the reviewWindows() helper matches the real boundaries; plus the
+deadline extension — works before delivery, reverts after delivery,
+beyond the 7-day bound, on a second use, and while rejected; plus a
+balance-invariant fuzz (contract balance always equals unsettled
+escrow amounts plus pending credits) and deadline/cure edge tests.
 
 ## Fork demo — verified on a local fork of Arc mainnet
 

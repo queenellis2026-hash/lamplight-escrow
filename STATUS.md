@@ -386,3 +386,76 @@ skipped (weaker than the reject path — redundant once reject exists).
   pre-revision contract and will shift; then mainnet deploy, demo,
   video, submit. No GitHub push and no Studio change were made in
   this task.
+## 13 · Round 5 — Claude round-4 findings + round-4 improvements — DONE Oct 27, 2026 (evening)
+
+Claude's round-4 re-review found the new reject/cure path unsafe for the
+payee (1 High, 1 Medium, 1 Low); Grok found nothing. This round fixes
+all three findings and implements Grok's + Claude's round-4 improvement
+and feature suggestions. Skipped only: partial-release (Grok feature —
+held) and the per-escrow arbiter (Claude feature — the one-rejection cap
+is the chosen fix).
+
+- **HIGH — payer could reject a valid delivery after the deadline and
+  refund immediately, with no cure possible.** rejectDelivery() reset
+  deliveredAt to 0, then refund() passed (deliveredAt == 0, now >=
+  deadline), and deliver() reverted "Deadline passed", so the 3-day cure
+  never opened. Fixed in three parts: (1) refund() now requires
+  rejectedAt == 0 ("Already rejected") — rejected escrows exit only
+  through refundAfterRejection(); (2) deliver() accepts a cure until
+  rejectedAt + REJECT_CURE_PERIOD even past the deadline; (3) rejections
+  are capped at ONE per escrow (new `rejectedOnce` flag — a second
+  rejectDelivery reverts "Already rejected"), so a payer cannot reject
+  every cured delivery in turn.
+- **MEDIUM — the cure window was never enforced on the payee side.**
+  deliver() only checked the deadline. Fixed: when rejectedAt != 0,
+  deliver() requires block.timestamp < rejectedAt + REJECT_CURE_PERIOD
+  ("Cure period ended") — after the window the payee can no longer
+  front-run refundAfterRejection with a junk hash and a fresh review
+  window. The boundary is exact: cure < rejectedAt + 3d, refund >=.
+- **LOW — the new tests covered neither of the above.** Added three:
+  reject near/after the deadline then refund() reverts; re-deliver
+  after the cure period reverts; a second rejection on the same escrow
+  reverts. The old test that expected a cured delivery to be rejectable
+  again was rewritten to assert the revert (one-rejection cap).
+- **View helper (Grok improvement 1):** new `reviewWindows(id)` returns
+  (reviewEnd, cureEnd) — deliveredAt + REVIEW_PERIOD and rejectedAt +
+  REJECT_CURE_PERIOD, each 0 when it does not apply — mirroring HSK's
+  claimWindows. Tested against the real boundaries (reject at reviewEnd
+  reverts, payee claims there; cure at cureEnd-1 succeeds).
+- **Extend deadline (Grok feature):** new `extendDeadline(id, extra)`
+  — payer-only, before delivery, once only, at most +7 days
+  (`MAX_DEADLINE_EXTENSION`), never on a rejected escrow, new deadline
+  must fit uint40. `DeadlineExtended` event. Cannot reopen the front-run
+  hole: after delivery the deadline gates nothing, and the increase is
+  bounded.
+- **Split fuzz, full uint96 range (Grok improvement 3):** a fuzz test
+  sweeping msg.value across the full uint96 range with random share
+  vectors summing to 10,000 — contract balance ends at zero, dust
+  always lands on a non-zero-share recipient.
+- **Balance invariant + boundary tests (Claude improvement):** a fuzz
+  test asserting address(this).balance always equals unsettled escrow
+  amounts plus pending credits, after every step of a fuzzed
+  create/deliver/release/reject/cure/refund/split sequence (256 runs);
+  plus pinned deadline/cure edges (deliver at deadline-1 succeeds, at
+  the deadline reverts; cure at cure-end-1 succeeds, at the cure end
+  reverts; refundAfterRejection at cure-end-1 reverts, at the cure end
+  succeeds).
+- **uint40 timestamps (Claude improvement):** the three timestamps
+  shrank uint64 → uint40; the struct is now 4 slots (96 + 3×40 + 3
+  bools = 240 bits in one slot). createEscrow gas 129,991 → 129,780
+  (211 saved, measured with the same throwaway gasleft() test) — the
+  eliminated slot held a zero value, so the saving is small; the gain
+  is one fewer cold SLOAD on the reject/cure paths. The gas-guard tests
+  still discriminate (the hardcoded 153,000 underfund limit still
+  reverts; the sweep is adaptive).
+- **Tests: 79 passed, 0 failed** (67 before + 12 new). One test-side fix
+  during the run: the invariant fuzz's helper double-counted escrow 0
+  (uninitialized array slots default to id 0) — the helper now takes an
+  explicit count.
+- **Still needed before deploy (Ellis, not this task):** update the
+  contract in Arc Studio to match the revised repo source and re-verify
+  (the repo NO LONGER matches Studio); re-run the fork demo
+  (`fork-demo.sh`) — the gas figures in README/§4 are from the
+  pre-revision contract and will shift; then mainnet deploy, demo,
+  video, submit. No GitHub push and no Studio change were made in
+  this task.
