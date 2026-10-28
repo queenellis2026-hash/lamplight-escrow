@@ -108,10 +108,13 @@ contract LamplightEscrow {
     /// @dev Cure window after a payer rejects a delivery: the payee has
     ///   this long to re-deliver a corrected hash (before the escrow
     ///   deadline, as always). If it does not cure in time, the payer may
-    ///   refund via refundAfterRejection(). 3 days is long enough to fix
-    ///   real work and short enough that a rejected escrow does not sit
-    ///   in limbo.
-    uint256 public constant REJECT_CURE_PERIOD = 3 days;
+    ///   refund via refundAfterRejection(). The cure window EQUALS the
+    ///   review window (REVIEW_PERIOD, 7 days) — deliberately: with a
+    ///   shorter cure a payer could reject at deliveredAt + 7d - 1s and
+    ///   win by default if the payee was offline for the cure, so the
+    ///   cure must last as long as the review the rejection came from
+    ///   (round 6, Oct 27, 2026, Claude Medium).
+    uint256 public constant REJECT_CURE_PERIOD = REVIEW_PERIOD;
 
     /// @dev Extra gas required above the 63/64-rule minimum in _payOrCredit.
     ///   The 63/64 cap is applied AFTER the CALL's own base cost is charged
@@ -126,7 +129,7 @@ contract LamplightEscrow {
     /// @dev Max one-time deadline extension (see extendDeadline): 7 days.
     ///   Bounded and once-only so an extension can never reopen the
     ///   front-run hole the deadline rule closes — it cannot be called
-    ///   after delivery, and the increase is capped.
+    ///   after delivery or at/after the deadline, and the increase is capped.
     uint256 public constant MAX_DEADLINE_EXTENSION = 7 days;
 
     event EscrowCreated(
@@ -330,7 +333,10 @@ contract LamplightEscrow {
     ///   refund), and the increase is capped so a payer cannot push the
     ///   deadline out indefinitely. It also cannot be used on a rejected
     ///   escrow — the cure window, not the deadline, is the binding clock
-    ///   there. The new deadline must still fit the packed uint40 field.
+    ///   there — nor at or after the deadline: an expired escrow stays
+    ///   expired, so a payer cannot revive it and let the payee deliver
+    ///   again (round 6, Oct 27, 2026, Claude Low). The new deadline must
+    ///   still fit the packed uint40 field.
     /// @param id Existing, undelivered, unsettled escrow identifier.
     /// @param extraSeconds Seconds to add to the deadline (1 .. 7 days).
     function extendDeadline(uint256 id, uint256 extraSeconds) external nonReentrant {
@@ -340,6 +346,7 @@ contract LamplightEscrow {
         require(!escrow.settled, "Already settled");
         require(escrow.deliveredAt == 0, "Already delivered");
         require(escrow.rejectedAt == 0, "Already rejected");
+        require(block.timestamp < escrow.deadline, "Deadline passed");
         require(!escrow.deadlineExtended, "Deadline already extended");
         require(extraSeconds > 0 && extraSeconds <= MAX_DEADLINE_EXTENSION, "Invalid extension");
         uint256 newDeadline = uint256(escrow.deadline) + extraSeconds;
@@ -384,6 +391,54 @@ contract LamplightEscrow {
     /// @return The escrow's complete stored fields.
     function getEscrow(uint256 id) external view returns (Escrow memory) {
         return escrows[id];
+    }
+
+    /// @notice The lifecycle state of an escrow, as a single enum, so
+    ///   front-ends and indexers never re-derive the state machine from
+    ///   the three timestamps (deadline, deliveredAt, rejectedAt).
+    ///   Nonexistent = no escrow at this id; Created = funded,
+    ///   undelivered, deadline not yet reached; Expired = funded,
+    ///   undelivered, deadline reached (payer may refund); InReview =
+    ///   delivered, inside the review window; Claimable = delivered,
+    ///   review window over (payee may claim); CureOpen = rejected,
+    ///   cure window still open (payee may re-deliver); Rejected =
+    ///   rejected, cure window over (payer may refundAfterRejection);
+    ///   Settled = released or refunded.
+    enum Lifecycle {
+        Nonexistent,
+        Created,
+        Expired,
+        InReview,
+        Claimable,
+        CureOpen,
+        Rejected,
+        Settled
+    }
+
+    /// @notice Read an escrow's lifecycle state.
+    /// @dev Boundaries mirror the state-changing functions exactly:
+    ///   InReview while block.timestamp < deliveredAt + REVIEW_PERIOD
+    ///   (a reject there reverts; the payee may claim from the boundary),
+    ///   CureOpen while block.timestamp < rejectedAt + REJECT_CURE_PERIOD
+    ///   (a cure there reverts; the payer may refund from the boundary),
+    ///   Expired from block.timestamp >= deadline (refund's rule).
+    /// @param id Escrow identifier to read.
+    /// @return The escrow's lifecycle state.
+    function lifecycleStatus(uint256 id) external view returns (Lifecycle) {
+        Escrow storage escrow = escrows[id];
+        if (escrow.payer == address(0)) return Lifecycle.Nonexistent;
+        if (escrow.settled) return Lifecycle.Settled;
+        if (escrow.rejectedAt != 0) {
+            return block.timestamp < escrow.rejectedAt + REJECT_CURE_PERIOD
+                ? Lifecycle.CureOpen
+                : Lifecycle.Rejected;
+        }
+        if (escrow.deliveredAt != 0) {
+            return block.timestamp < escrow.deliveredAt + REVIEW_PERIOD
+                ? Lifecycle.InReview
+                : Lifecycle.Claimable;
+        }
+        return block.timestamp < escrow.deadline ? Lifecycle.Created : Lifecycle.Expired;
     }
 
     /// @notice The two timestamps that bound the review window and the cure
@@ -461,7 +516,15 @@ contract LamplightEscrow {
     ///   gas, so a caller with a low gas limit could otherwise force a credit
     ///   instead of a direct payout; this check makes that fail loudly
     ///   instead, and the caller must retry with enough gas.
+    /// @dev A zero-value credit must never happen: a Credited event for 0
+    ///   would confuse indexers and front-ends. Every public entry point
+    ///   already enforces a nonzero amount (createEscrow / splitPayment
+    ///   require value > 0, and splitPayment skips zero-share recipients
+    ///   before calling), so this guard is defense in depth at the single
+    ///   choke point all payouts funnel through (round 6, Oct 27, 2026,
+    ///   Grok improvement); it cannot fire through a public call today.
     function _payOrCredit(address to, uint256 amount) internal {
+        require(amount > 0, "Zero payment");
         require(
             gasleft() > (PAYOUT_GAS_LIMIT * 64) / 63 + PAYOUT_GAS_BUFFER,
             "Insufficient gas for payout"

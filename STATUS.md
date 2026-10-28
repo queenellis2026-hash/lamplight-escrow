@@ -459,3 +459,65 @@ is the chosen fix).
   pre-revision contract and will shift; then mainnet deploy, demo,
   video, submit. No GitHub push and no Studio change were made in
   this task.
+
+## 14 · Round 6 — Claude round-5 findings + Grok round-5 improvements — DONE Oct 27, 2026 (evening)
+- **Cure window = review window (Claude Medium, the fix-first item):**
+  `REJECT_CURE_PERIOD` was 3 days while `REVIEW_PERIOD` is 7, so a payer
+  could reject at deliveredAt + 7d - 1s and win by default if the payee
+  was offline 3 days. Fix is the one-constant change:
+  `REJECT_CURE_PERIOD = REVIEW_PERIOD` (7 days), with the NatSpec
+  rewritten to say why. New test: reject at deliveredAt + 7d - 1s, cure
+  on day six succeeds and releases normally; a second escrow pins the
+  refund side (reverts at cure-end-1, succeeds at the cure end). All
+  existing cure tests moved from 3-day to 7-day literals.
+- **extendDeadline deadline check (Claude Low):** `extendDeadline` had
+  no `block.timestamp < deadline` check, so a payer could revive an
+  expired undelivered escrow and let the payee deliver again. Fix:
+  `require(block.timestamp < escrow.deadline, "Deadline passed")`,
+  placed before the once-only check. New test: extend at exactly the
+  deadline reverts, and the refund path is still the only exit.
+- **Cure accepts any hash (Claude Low — DOCUMENTED, not fixed):** after
+  one rejection the payee can re-deliver the same junk hash; the payer
+  cannot reject again (one-rejection cap) and cannot refund, so the
+  payee is paid after the review window. Stated plainly in README
+  ("Security notes / limits") and here: rejection is a delay, not
+  protection; real protection needs the per-escrow arbiter feature,
+  which is v2 (out of scope for this round).
+- **Zero-amount guard (Grok improvement 1):** `_payOrCredit` now
+  requires amount > 0 ("Zero payment"), defense in depth at the single
+  choke point all payouts funnel through. Every public entry point
+  already enforces nonzero amounts, so the guard cannot fire through a
+  public call today; it exists so a future zero-value credit can never
+  emit a confusing Credited event.
+- **Balance invariant, per-address bound (Grok improvement 2):** the
+  invariant helper now also asserts no single pull credit exceeds the
+  contract's native balance, for every address that can hold a credit.
+- **lifecycleStatus view (Grok improvement 3):** new
+  `lifecycleStatus(id)` returns one enum — Nonexistent / Created /
+  Expired / InReview / Claimable / CureOpen / Rejected / Settled —
+  with boundaries mirroring the state-changing functions exactly
+  (InReview while now < deliveredAt + REVIEW_PERIOD, CureOpen while
+  now < rejectedAt + REJECT_CURE_PERIOD, Expired from now >= deadline).
+  New test walks escrows through every state.
+- **bound() + invariant test with handlers (Claude improvement):** the
+  full-uint96 split fuzz now uses `bound()` instead of `vm.assume`
+  (assume() on a uint256 can reject most inputs and risks "too many
+  rejects" flakiness); the other split fuzz already used bound(). New
+  `EscrowInvariantHandler` + `LamplightEscrowInvariantTest`: the handler
+  drives random sequences of creates, deliveries, rejects, releases,
+  refunds, extensions and splits (all calls try/catch — a revert is a
+  legal outcome), and the invariant asserts the balance invariant plus
+  the per-address credit bound after every sequence. foundry.toml pins
+  `[invariant] runs = 256, depth = 15`: this forge version (1.8.6)
+  defaults depth to 500 (256 x 500 = 128,000 handler calls), which made
+  the suite hang for 6+ minutes; with the pin the whole suite runs in
+  ~2 seconds.
+- **Tests: 83 passed, 0 failed** (79 before + 3 new unit tests + 1
+  invariant test). No GitHub push and no Studio change were made in
+  this task — verify + push is Ellis's step.
+- **Still needed before deploy:** update the contract in Arc Studio to
+  match the revised repo source and re-verify (the repo NO LONGER
+  matches Studio — it has now diverged through rounds 2–6); re-run the
+  fork demo (`fork-demo.sh`) — the gas figures in README/§4 are from
+  the pre-revision contract and will shift; then mainnet deploy, demo,
+  video, submit.

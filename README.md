@@ -21,16 +21,24 @@ Two of the Microgrants' suggested tracks in one contract:
    payee may release and claim the funds, so funds can never lock forever.
    If delivery never happens, the payer is refunded after the deadline
    (`refund`). If the payer rejects a delivery inside the review window
-   (`rejectDelivery`), the payee has a **3-day cure window** to re-deliver
+   (`rejectDelivery`), the payee has a **7-day cure window** to re-deliver
    a corrected hash — even past the deadline, but only inside the cure
    window; if it does not cure in time, the payer may refund
-   (`refundAfterRejection`). A rejected escrow can never take the plain
+   (`refundAfterRejection`). The cure window equals the review window
+   (both 7 days) on purpose: with a shorter cure a payer could reject at
+   the last second of the review window and win by default if the payee
+   was offline. A rejected escrow can never take the plain
    `refund()` path, so a payer cannot reject a valid delivery after the
    deadline and refund immediately. Rejections are capped at **one per
    escrow**: a cured delivery cannot be rejected again. The payer may also
    extend an undelivered escrow's deadline once, by at most 7 days
-   (`extendDeadline`, before delivery only). A junk hash delivered just
+   (`extendDeadline`, before delivery and before the deadline only — an
+   expired escrow stays expired). A junk hash delivered just
    before the deadline can no longer auto-pay after 7 days with no recourse.
+   `lifecycleStatus(id)` returns the escrow's full lifecycle state as one
+   enum (Created / Expired / InReview / Claimable / CureOpen / Rejected /
+   Settled / Nonexistent), so front-ends never re-derive the state machine
+   from the three timestamps.
 2. **Payment splitting** — one incoming USDC payment split across up to 5
    recipients in a single transaction, by basis points
    (`splitPayment`, shares must sum to 10,000; rounding dust goes to the
@@ -85,9 +93,9 @@ second track (revenue splits / team payouts) in the same deploy.
 
 | Path | What it is |
 |---|---|
-| `contracts/LamplightEscrow.sol` | The contract (Solidity 0.8.24, MIT). Pull-payment design, 7-day review window, deadline-checked delivery, payer reject + 3-day cure window (one rejection per escrow), one-time deadline extension (max 7 days), packed storage (4 slots). Revised after review Oct 27, 2026 — Studio re-verification pending. |
+| `contracts/LamplightEscrow.sol` | The contract (Solidity 0.8.24, MIT). Pull-payment design, 7-day review window, deadline-checked delivery, payer reject + 7-day cure window (one rejection per escrow), one-time deadline extension (max 7 days, before the deadline), packed storage (4 slots), `lifecycleStatus()` view, zero-amount payout guard. Revised after review Oct 27, 2026 — Studio re-verification pending. |
 | `studio-contract-reference.sol` | Studio's contract source BEFORE the Oct 27 revision (read-only reference for the diff). |
-| `test/LamplightEscrow.t.sol` | 79 Foundry tests — happy path, every revert, pull-payment cases, review-window cases, reentrancy, split fuzz (full uint96 range), reject/cure path, gas-guard sweep, balance invariant, deadline extension. |
+| `test/LamplightEscrow.t.sol` | 83 Foundry tests — happy path, every revert, pull-payment cases, review-window cases, reentrancy, split fuzz (full uint96 range, bound()), reject/cure path, gas-guard sweep, balance invariant (plus invariant test with handler), deadline extension, lifecycleStatus. |
 | `script/Deploy.s.sol` | Forge deploy script (Arc mainnet / testnet). |
 | `app/` | Static front-end (`index.html`, `app.js`, `abi.json`). Connects a wallet, creates / delivers / releases / refunds escrows, splits payments, and has a no-wallet simulated demo. |
 | `fork-demo.log` | Full end-to-end run on a local Anvil fork of Arc mainnet (chain 5042), with tx hashes and gas. |
@@ -100,7 +108,7 @@ second track (revenue splits / team payouts) in the same deploy.
 ## Tests — verified
 
 ```
-forge test   # 79 passed; 0 failed
+forge test   # 83 passed; 0 failed
 ```
 
 Coverage: create locks funds; full create → deliver → release path; every
@@ -140,16 +148,29 @@ last nonzero-share one takes the dust, and a zero-share recipient gets
 nothing — and a second fuzz sweeping msg.value across the full uint96
 range with random share vectors; plus the reject path — reject inside
 the window then cure then release, reject after the window reverts,
-uncured rejection refunds after the 3-day cure window (and reverts before
+uncured rejection refunds after the 7-day cure window (and reverts before
 it), reject of an undelivered escrow reverts, double-reject reverts, a
 cured delivery can NOT be rejected again (one-rejection cap), a rejected
 escrow cannot take the plain refund() path, a cure after the cure window
 reverts, a cure past the deadline inside the cure window succeeds, and
-the reviewWindows() helper matches the real boundaries; plus the
+the reviewWindows() helper matches the real boundaries; plus a reject at
+the last second of the review window still leaves the payee the full
+7-day cure (a cure on day six succeeds; the refund opens only at the
+cure end); plus the
 deadline extension — works before delivery, reverts after delivery,
-beyond the 7-day bound, on a second use, and while rejected; plus a
+beyond the 7-day bound, on a second use, while rejected, and after the
+deadline (an expired escrow stays expired); plus a
 balance-invariant fuzz (contract balance always equals unsettled
-escrow amounts plus pending credits) and deadline/cure edge tests.
+escrow amounts plus pending credits, and no single credit exceeds the
+contract balance) and deadline/cure edge tests; plus an invariant test
+with a handler driving random sequences of creates, deliveries, rejects,
+releases, refunds, extensions and splits, asserting the same balance
+invariant after every sequence (foundry.toml pins [invariant] runs =
+256, depth = 15 — this forge version defaults depth to 500, which makes
+the suite take many minutes); plus `lifecycleStatus()` walking an escrow
+through every state (Nonexistent / Created / Expired / InReview /
+Claimable / CureOpen / Rejected / Settled). The split fuzzes use
+bound(), not vm.assume.
 
 ## Fork demo — verified on a local fork of Arc mainnet
 
@@ -193,9 +214,26 @@ demo payee/recipients — so the net sunk cost of going live is the gas:
 
 Built in Arc Studio (project
 https://studio.arc.io/app/16fcd6f7-5614-4e37-aee6-ad6575f83d73),
-deployed to Arc Testnet, and verified: 67/67 tests and a fork demo.
+deployed to Arc Testnet, and verified: 83/83 tests and a fork demo.
 Mainnet deploy, demo flow, and video walkthrough are next; the
 submission closes Nov 1, 2026.
+
+> **Round 6 (Oct 27, 2026, evening):** Claude's round-5 re-review (both
+> contracts SOUND) left one Medium and two Lows on Arc, plus Grok's three
+> round-5 improvements — all fixed here: the cure window is now 7 days,
+> equal to the review window (a last-second reject no longer wins by
+> default if the payee is offline); `extendDeadline` now requires
+> `block.timestamp < deadline`, so an expired escrow cannot be revived;
+> `_payOrCredit` has an explicit amount > 0 guard (defense in depth at
+> the single choke point all payouts funnel through); the balance
+> invariant now also asserts no single pull credit exceeds the
+> contract's balance; a `lifecycleStatus(id)` view returns the full
+> lifecycle state as one enum; the split fuzzes use `bound()` instead of
+> `vm.assume`, and an invariant test with a handler drives random action
+> sequences against the same balance invariant (foundry.toml pins
+> [invariant] runs = 256, depth = 15). The cure-accepts-any-hash limit is
+> documented as a known limitation above — rejection is a delay, not
+> protection; the per-escrow arbiter that would close it is v2.
 
 > **Round 4 — "make it better" (Oct 27, 2026, evening):** the reviewers'
 > improvement and feature suggestions, implemented properly: the Escrow
@@ -225,7 +263,7 @@ submission closes Nov 1, 2026.
   tracked function.
 - **v1 has no third-party arbitrator.** If payer and payee disagree after
   delivery, the payer may reject the delivery inside the 7-day review
-  window (`rejectDelivery`); the payee then has 3 days to cure with a
+  window (`rejectDelivery`); the payee then has 7 days to cure with a
   corrected hash, or the payer refunds. The payer's protection is
   verifying the delivery hash before releasing, rejecting junk, and
   refunding before the deadline if nothing is delivered. The payee's
@@ -233,6 +271,15 @@ submission closes Nov 1, 2026.
   and claim the funds, so a silent payer cannot lock them forever. A
   third-party arbitrator role is the planned v2. This is stated in the
   app and the submission, not hidden.
+- **Known limitation — the cure accepts any hash (documented, not fixed
+  in v1).** After one rejection the payee can re-deliver the *same* junk
+  hash: the contract only checks that the hash is nonzero, and the payer
+  cannot reject again (one-rejection cap) and cannot refund, so the payee
+  is paid after the review window. Rejection is therefore a delay, not
+  protection — its real value is the 7-day cure window it buys the payer
+  to verify the work off-chain and, if it is junk, to refuse further
+  business. Real protection needs the per-escrow arbiter feature, which
+  is v2 (out of scope for this round).
 - Not audited. Experimental software — use small amounts.
 
 ## Licence
