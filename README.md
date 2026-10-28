@@ -24,7 +24,9 @@ Two of the Microgrants' suggested tracks in one contract:
    (`rejectDelivery`), the payee has a **7-day cure window** to re-deliver
    a corrected hash — even past the deadline, but only inside the cure
    window; if it does not cure in time, the payer may refund
-   (`refundAfterRejection`). The cure window equals the review window
+   (`refundAfterRejection`). The rejected hash is emitted in the
+   `DeliveryRejected` event, so off-chain parties can still prove what
+   was rejected after the clear. The cure window equals the review window
    (both 7 days) on purpose: with a shorter cure a payer could reject at
    the last second of the review window and win by default if the payee
    was offline. A rejected escrow can never take the plain
@@ -153,7 +155,10 @@ it), reject of an undelivered escrow reverts, double-reject reverts, a
 cured delivery can NOT be rejected again (one-rejection cap), a rejected
 escrow cannot take the plain refund() path, a cure after the cure window
 reverts, a cure past the deadline inside the cure window succeeds, and
-the reviewWindows() helper matches the real boundaries; plus a reject at
+the reviewWindows() helper matches the real boundaries; plus a test
+proving the rejected work hash is emitted in the DeliveryRejected
+event (and that after a cure the live hash is the corrected one, the
+rejected hash surviving only in the event history); plus a reject at
 the last second of the review window still leaves the payee the full
 7-day cure (a cure on day six succeeds; the refund opens only at the
 cure end); plus the
@@ -214,7 +219,7 @@ demo payee/recipients — so the net sunk cost of going live is the gas:
 
 Built in Arc Studio (project
 https://studio.arc.io/app/16fcd6f7-5614-4e37-aee6-ad6575f83d73),
-deployed to Arc Testnet, and verified: 83/83 tests and a fork demo.
+deployed to Arc Testnet, and verified: 84/84 tests and a fork demo.
 Mainnet deploy, demo flow, and video walkthrough are next; the
 submission closes Nov 1, 2026.
 
@@ -234,6 +239,14 @@ submission closes Nov 1, 2026.
 > [invariant] runs = 256, depth = 15). The cure-accepts-any-hash limit is
 > documented as a known limitation above — rejection is a delay, not
 > protection; the per-escrow arbiter that would close it is v2.
+>
+> **Round 7 (Oct 27, 2026, evening):** Grok's round-6 improvements,
+> two of three — the rejected work hash is now emitted in the
+> `DeliveryRejected` event (off-chain proof of what was rejected after
+> the clear; a test pins the exact hash and the cure's corrected hash);
+> the "what can I do next" view was skipped (the `lifecycleStatus`
+> view already covers most of it) and the bonded-arbiter / batch-release
+> features are v2. Tests: 84/84.
 
 > **Round 4 — "make it better" (Oct 27, 2026, evening):** the reviewers'
 > improvement and feature suggestions, implemented properly: the Escrow

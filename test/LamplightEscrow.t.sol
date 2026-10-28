@@ -1319,6 +1319,27 @@ contract LamplightEscrowTest is Test {
         assertTrue(esc.getEscrow(id).settled);
     }
 
+    function testRejectEmitsRejectedWorkHash() public {
+        // Grok improvement 1 (round 7): the rejected work hash is emitted
+        // in DeliveryRejected, so off-chain parties can prove what was
+        // rejected after the clear. After a cure + re-delivery, the live
+        // hash is the new one — the rejected hash survives only in the
+        // event history (the struct holds zero right after the reject,
+        // then the corrected hash after the cure).
+        uint256 id = _delivered(0.5 ether); // delivers keccak256("work v1")
+        bytes32 rejectedHash = keccak256("work v1");
+        vm.expectEmit(true, true, false, true);
+        emit LamplightEscrow.DeliveryRejected(id, payer, rejectedHash);
+        vm.prank(payer);
+        esc.rejectDelivery(id);
+        assertEq(esc.getEscrow(id).workHash, bytes32(0));
+        // the payee cures with a corrected hash; the live hash is the new one
+        vm.prank(payee);
+        esc.deliver(id, keccak256("work v2 fixed"));
+        assertEq(esc.getEscrow(id).workHash, keccak256("work v2 fixed"));
+        assertEq(esc.getEscrow(id).rejectedAt, 0);
+    }
+
     function testRejectAfterWindowReverts() public {
         // A reject after the review window ends is too late: at the exact
         // boundary second the payee may already claim, so the payee wins

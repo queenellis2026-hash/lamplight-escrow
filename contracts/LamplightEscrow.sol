@@ -140,7 +140,7 @@ contract LamplightEscrow {
         uint256 deadline
     );
     event Delivered(uint256 indexed id, bytes32 workHash);
-    event DeliveryRejected(uint256 indexed id, address indexed payer);
+    event DeliveryRejected(uint256 indexed id, address indexed payer, bytes32 rejectedWorkHash);
     event DeadlineExtended(uint256 indexed id, uint256 newDeadline);
     event Released(uint256 indexed id, address indexed payee, uint256 amount);
     event Refunded(uint256 indexed id, address indexed payer, uint256 amount);
@@ -233,11 +233,13 @@ contract LamplightEscrow {
     ///   and workHash go back to zero) and starts the cure clock: the
     ///   payee may re-deliver a corrected hash within REJECT_CURE_PERIOD
     ///   (even past the deadline); if it does not, the payer may refund
-    ///   via refundAfterRejection(). The rejected hash stays on record in
-    ///   the Delivered event. Rejections are capped at ONE per escrow
-    ///   (rejectedOnce): a cured delivery cannot be rejected again, so a
-    ///   payer cannot reject every cured delivery in turn and the payee's
-    ///   cure is real protection, not a treadmill.
+    ///   via refundAfterRejection(). The rejected hash is emitted in the
+    ///   DeliveryRejected event, so off-chain parties can still prove
+    ///   what was rejected after the clear (it also remains in the
+    ///   earlier Delivered event's history). Rejections are capped at ONE
+    ///   per escrow (rejectedOnce): a cured delivery cannot be rejected
+    ///   again, so a payer cannot reject every cured delivery in turn and
+    ///   the payee's cure is real protection, not a treadmill.
     /// @param id Existing, delivered, unsettled escrow identifier.
     function rejectDelivery(uint256 id) external nonReentrant {
         Escrow storage escrow = escrows[id];
@@ -248,11 +250,12 @@ contract LamplightEscrow {
         require(escrow.deliveredAt != 0, "Not delivered");
         require(block.timestamp < escrow.deliveredAt + REVIEW_PERIOD, "Review period ended");
 
+        bytes32 rejectedHash = escrow.workHash;
         escrow.rejectedOnce = true;
         escrow.rejectedAt = uint40(block.timestamp);
         escrow.deliveredAt = 0;
         escrow.workHash = bytes32(0);
-        emit DeliveryRejected(id, msg.sender);
+        emit DeliveryRejected(id, msg.sender, rejectedHash);
     }
 
     /// @notice Refund a rejected delivery the payee did not cure in time.

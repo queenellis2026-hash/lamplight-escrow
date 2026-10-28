@@ -517,7 +517,29 @@ is the chosen fix).
   this task — verify + push is Ellis's step.
 - **Still needed before deploy:** update the contract in Arc Studio to
   match the revised repo source and re-verify (the repo NO LONGER
-  matches Studio — it has now diverged through rounds 2–6); re-run the
+  matches Studio — it has now diverged through rounds 2–7); re-run the
   fork demo (`fork-demo.sh`) — the gas figures in README/§4 are from
   the pre-revision contract and will shift; then mainnet deploy, demo,
   video, submit.
+
+## 15 · Round 7 — Grok round-6 improvements (2 of 3) — DONE Oct 27, 2026 (evening)
+
+- **Rejected work hash emitted (Grok improvement 1):**
+  `DeliveryRejected` now carries `bytes32 rejectedWorkHash` — the hash
+  `rejectDelivery` clears from storage is captured before the clear and
+  emitted, so off-chain parties can still prove what was rejected after
+  the clear (it also remains in the earlier `Delivered` event's
+  history). NatSpec updated. New test
+  `testRejectEmitsRejectedWorkHash`: `vm.expectEmit` pins the exact
+  rejected hash in the event, the struct holds zero right after the
+  reject, and after a cure + re-delivery the live hash is the corrected
+  one.
+- **Skipped:** Grok improvement 2 (a "what can I do next" view for both
+  contracts) — `lifecycleStatus()` already covers most of it; Grok's
+  features (per-escrow bonded-stake arbiter, batch release/refund) are
+  v2, NOT built here (out of scope). Claude's round-6 findings are still
+  pending (resume after the 9:00 PM CDT limit reset) and are NOT part of
+  this round — these two items fold in with whatever Claude says later.
+- **Tests: 84 passed, 0 failed** (83 before + 1 new event test). No
+  GitHub push and no Studio change were made in this task — verify +
+  push is Ellis's step.
