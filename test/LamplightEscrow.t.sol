@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import "../contracts/LamplightEscrow.sol";
 
 /// @notice A recipient whose receive() refuses payment while `reverting`
@@ -1338,6 +1339,28 @@ contract LamplightEscrowTest is Test {
         esc.deliver(id, keccak256("work v2 fixed"));
         assertEq(esc.getEscrow(id).workHash, keccak256("work v2 fixed"));
         assertEq(esc.getEscrow(id).rejectedAt, 0);
+    }
+
+    function testRejectEventFieldsAndStorageZeroed() public {
+        // Grok improvement 1 (round 8): the round-7 test pins the emitted
+        // hash via expectEmit; this companion reads the raw log, so the
+        // indexed fields are asserted explicitly — topic[1] is the
+        // escrow id, topic[2] is the payer — and the workHash is zeroed
+        // in storage immediately after the emit, before any cure. The
+        // rejected hash then survives only in the event history.
+        uint256 id = _delivered(0.5 ether); // delivers keccak256("work v1")
+        bytes32 rejectedHash = keccak256("work v1");
+        vm.recordLogs();
+        vm.prank(payer);
+        esc.rejectDelivery(id);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 1); // reject emits exactly one event
+        assertEq(logs[0].topics[0], keccak256("DeliveryRejected(uint256,address,bytes32)"));
+        assertEq(logs[0].topics[1], bytes32(id));
+        assertEq(logs[0].topics[2], bytes32(uint256(uint160(payer))));
+        assertEq(abi.decode(logs[0].data, (bytes32)), rejectedHash);
+        assertEq(esc.getEscrow(id).workHash, bytes32(0));
+        assertTrue(esc.getEscrow(id).rejectedAt != 0); // cure clock started
     }
 
     function testRejectAfterWindowReverts() public {

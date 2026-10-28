@@ -543,3 +543,16 @@ is the chosen fix).
 - **Tests: 84 passed, 0 failed** (83 before + 1 new event test). No
   GitHub push and no Studio change were made in this task — verify +
   push is Ellis's step.
+
+## 16 · Round 8 — Grok round-7 improvements (all 3) — DONE Oct 27, 2026 (evening)
+
+- **Rejection event test strengthened (Grok improvement 1):** new
+  companion test `testRejectEventFieldsAndStorageZeroed` reads the raw
+  log with `vm.recordLogs` — it asserts the indexed fields explicitly
+  (topic[1] is the escrow id, topic[2] is the payer) and the data
+  (the rejected hash), and that `workHash` is zeroed in storage
+  immediately after the emit, before any cure (`rejectedAt` nonzero —
+  the cure clock started). The round-7 `expectEmit` test is untouched.
+- **Tests: 85 passed, 0 failed** (84 before + 1 new event test). No
+  GitHub push and no Studio change were made in this task — verify +
+  push is Ellis's step.

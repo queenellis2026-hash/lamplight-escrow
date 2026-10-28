@@ -219,7 +219,7 @@ demo payee/recipients — so the net sunk cost of going live is the gas:
 
 Built in Arc Studio (project
 https://studio.arc.io/app/16fcd6f7-5614-4e37-aee6-ad6575f83d73),
-deployed to Arc Testnet, and verified: 84/84 tests and a fork demo.
+deployed to Arc Testnet, and verified: 85/85 tests and a fork demo.
 Mainnet deploy, demo flow, and video walkthrough are next; the
 submission closes Nov 1, 2026.
 
