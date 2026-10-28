@@ -97,7 +97,7 @@ second track (revenue splits / team payouts) in the same deploy.
 |---|---|
 | `contracts/LamplightEscrow.sol` | The contract (Solidity 0.8.24, MIT). Pull-payment design, 7-day review window, deadline-checked delivery, payer reject + 7-day cure window (one rejection per escrow), one-time deadline extension (max 7 days, before the deadline), packed storage (4 slots), `lifecycleStatus()` view, zero-amount payout guard. Revised after review Oct 27, 2026 — Studio re-verification pending. |
 | `studio-contract-reference.sol` | Studio's contract source BEFORE the Oct 27 revision (read-only reference for the diff). |
-| `test/LamplightEscrow.t.sol` | 83 Foundry tests — happy path, every revert, pull-payment cases, review-window cases, reentrancy, split fuzz (full uint96 range, bound()), reject/cure path, gas-guard sweep, balance invariant (plus invariant test with handler), deadline extension, lifecycleStatus. |
+| `test/LamplightEscrow.t.sol` | 85 Foundry tests — happy path, every revert, pull-payment cases, review-window cases, reentrancy, split fuzz (full uint96 range, bound()), reject/cure path, gas-guard sweep, balance invariant (plus invariant test with handler), deadline extension, lifecycleStatus, rejection-event field/storage assertions (round 8). The two gas-guard boundary tests derive their limits from `_minGasForDirectPay` (round 9) instead of hardcoding them. |
 | `script/Deploy.s.sol` | Forge deploy script (Arc mainnet / testnet). |
 | `app/` | Static front-end (`index.html`, `app.js`, `abi.json`). Connects a wallet, creates / delivers / releases / refunds escrows, splits payments, and has a no-wallet simulated demo. |
 | `fork-demo.log` | Full end-to-end run on a local Anvil fork of Arc mainnet (chain 5042), with tx hashes and gas. |
@@ -247,6 +247,22 @@ submission closes Nov 1, 2026.
 > the "what can I do next" view was skipped (the `lifecycleStatus`
 > view already covers most of it) and the bonded-arbiter / batch-release
 > features are v2. Tests: 84/84.
+>
+> **Round 8 (Oct 27, 2026, evening):** Grok's round-7 improvements, all
+> three — the rejection-event test now also asserts the indexed id/payer
+> fields and that `workHash` is zeroed in storage immediately after the
+> emit; the gas ceilings are documented in the contract's NatSpec as a
+> tripwire for future solc upgrades. Both contracts passed Grok and
+> Claude clean (no findings, both sound). Tests: 85/85.
+>
+> **Round 9 (Oct 27, 2026, evening):** Claude's round-8 improvement 3
+> (tests only on this contract) — the two gas-guard boundary tests now
+> derive their limits from `_minGasForDirectPay` instead of hardcoding
+> them, so they survive compiler drift; the assertions check deltas
+> because the binary search itself pays the burner on its probes. No
+> contract change in v1 this round. The per-escrow arbiter is NOT in v1
+> — it lives in a separate v2 line (`../arc-v2/`, see its README), and
+> v1 keeps getting upgraded. Tests: 85/85.
 
 > **Round 4 — "make it better" (Oct 27, 2026, evening):** the reviewers'
 > improvement and feature suggestions, implemented properly: the Escrow
@@ -282,8 +298,9 @@ submission closes Nov 1, 2026.
   refunding before the deadline if nothing is delivered. The payee's
   protection is the review window: after it ends, the payee may release
   and claim the funds, so a silent payer cannot lock them forever. A
-  third-party arbitrator role is the planned v2. This is stated in the
-  app and the submission, not hidden.
+  third-party arbitrator role is the planned v2 — it exists as a separate
+  line (`../arc-v2/`, optional per-escrow arbiter) and is NOT in v1.
+  This is stated in the app and the submission, not hidden.
 - **Known limitation — the cure accepts any hash (documented, not fixed
   in v1).** After one rejection the payee can re-deliver the *same* junk
   hash: the contract only checks that the hash is nonzero, and the payer

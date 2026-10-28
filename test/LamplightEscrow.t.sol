@@ -864,25 +864,32 @@ contract LamplightEscrowTest is Test {
         // threshold (~106,587) and silently under-forward to the payee.
         // The 40,000 buffer raises the threshold to ~141,587; a caller
         // leaving ~120,000 gas at the check (above the old threshold, below
-        // the new one) must now fail loudly instead. The release path burns
-        // ~33,000 gas before the check after struct packing (was ~75,000),
-        // so a 153,000 gas limit lands at ~120,000 gas left.
+        // the new one) must now fail loudly instead. Round 9 (Claude
+        // improvement 3): the limit is DERIVED from _minGasForDirectPay,
+        // not hardcoded — 21,000 below the derived minimum lands ~120,000
+        // gas left at the check, and the offset survives compiler drift
+        // because the release path's pre-check burn lives inside the
+        // derived minimum.
+        uint256 minLimit = _minGasForDirectPay(payee);
         uint256 id = _create(0.5 ether, 1 days);
         vm.prank(payee);
         esc.deliver(id, keccak256("x"));
         vm.prank(payer);
         vm.expectRevert("Insufficient gas for payout");
-        esc.release{gas: 153_000}(id);
+        esc.release{gas: minLimit - 21_000}(id);
     }
 
     function testPayoutGasGuardForwardsFullCapAtBoundary() public {
         // Re-review Low: at the new threshold (~141,587 gas left at the
         // check), the full 100,000 gas must actually reach the recipient.
-        // A recipient burning ~99,000 gas is paid directly — under the old
-        // 5,000 buffer the same gas limit would have forwarded only ~93.5k
-        // and credited it instead. A 220,000 gas limit lands at ~145,000
-        // gas left at the check, just above the threshold.
+        // A recipient burning ~99,000 gas is paid directly. Round 9
+        // (Claude improvement 3): the limit is DERIVED from
+        // _minGasForDirectPay for this exact burner, not hardcoded —
+        // releasing at exactly the derived minimum proves the threshold
+        // forwards the full cap, and the derivation survives compiler
+        // drift because the pre-check burn lives inside the minimum.
         GasBurnerExact burner = new GasBurnerExact(99_000);
+        uint256 minLimit = _minGasForDirectPay(address(burner));
         vm.prank(payer);
         uint256 id = esc.createEscrow{value: 0.5 ether}(
             address(burner),
@@ -890,12 +897,16 @@ contract LamplightEscrowTest is Test {
         );
         vm.prank(address(burner));
         esc.deliver(id, keccak256("x"));
+        uint256 before = address(burner).balance; // the binary search already
+        // paid this burner on its successful probes; assert the delta
+        uint256 escBefore = address(esc).balance; // the search's failed
+        // probes left their escrows funded and unsettled in the contract
         vm.prank(payer);
-        esc.release{gas: 220_000}(id);
+        esc.release{gas: minLimit}(id);
         assertTrue(esc.getEscrow(id).settled);
-        assertEq(address(burner).balance, 0.5 ether);
+        assertEq(address(burner).balance, before + 0.5 ether);
         assertEq(esc.pendingWithdrawals(address(burner)), 0);
-        assertEq(address(esc).balance, 0);
+        assertEq(address(esc).balance, escBefore - 0.5 ether);
     }
 
     // ---- Re-review round 3 (Oct 27, 2026): dust + unrecoverable credit ----

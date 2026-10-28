@@ -556,3 +556,27 @@ is the chosen fix).
 - **Tests: 85 passed, 0 failed** (84 before + 1 new event test). No
   GitHub push and no Studio change were made in this task — verify +
   push is Ellis's step.
+
+## 17 · Round 9 — Claude round-8 improvement 3 (tests only) — DONE Oct 27, 2026 (evening)
+
+- **Gas-guard limits derived, not hardcoded (Claude improvement 3):**
+  the two boundary tests (`testPayoutGasGuardRevertsWhenCallerUnderfundsGas`,
+  `testPayoutGasGuardForwardsFullCapAtBoundary`) now derive their gas
+  limits from `_minGasForDirectPay` instead of hardcoding 153,000 /
+  220,000 and quoting "~33,000 gas burned before the check" in comments.
+  The revert test uses `minLimit - 21,000` (lands ~120,000 gas left at
+  the check — above the old 5,000-buffer threshold, below the new
+  40,000-buffer one); the boundary test releases at exactly `minLimit`.
+  The assertions check deltas, because the binary search itself pays the
+  burner on its successful probes (and leaves its failed probes funded
+  and unsettled in the contract) — the same delta pattern the cold-empty
+  test already used. No contract change in v1 this round.
+- **Tests: 85 passed, 0 failed** (unchanged count — no new tests, two
+  rewritten). No GitHub push and no Studio change were made in this task
+  — verify + push is Ellis's step.
+- **V2 note (decision, Oct 27, 2026 ~9:20 PM CDT):** v1 and v2
+  stay separate — at deploy time we choose which one to use, and v1 keeps
+  getting upgraded. The optional per-escrow arbiter lives in a separate
+  v2 line (`../arc-v2/`, forked from v1 round 8 + arbiter, 99 tests) and
+  is NOT in v1. V2 gets upgraded the same way as v1 (same fix rounds,
+  same Grok + Claude re-review loop, same ChatGPT final gate).
