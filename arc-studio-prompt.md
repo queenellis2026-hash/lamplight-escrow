@@ -83,9 +83,9 @@ A clean single-page app, warm light-on-dark "lamplight" styling, with:
    line, total amount; validate the shares sum to 10000 before sending.
 5. A demo mode that runs the whole flow with simulated data and needs no
    wallet, clearly labelled as simulated.
-6. A short "how it works" section and an honest limits note: v1 has no
-   arbitrator — if payer and payee disagree after delivery, the payer
-   still holds the release.
+6. A short "how it works" section and an honest limits note: v2 has an
+   optional per-escrow arbiter — if payer and payee disagree after a
+   cured delivery, the payer may escalate to the arbiter, who decides.
 
 ## Deployment
 

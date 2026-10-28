@@ -21,15 +21,52 @@ pragma solidity ^0.8.24;
 ///      rejection may happen at most ONCE per escrow: a second rejection
 ///      reverts, so a payer cannot reject every cured delivery in turn.
 ///      The payer may also extend an undelivered escrow's deadline once,
-///      by at most 7 days, before delivery. No third-party arbitrator in
-///      v1 — that is a stated limitation, not an oversight (see README).
+///      by at most 7 days, before delivery. V2 adds an OPTIONAL
+///      per-escrow arbiter (see createEscrow): at creation the payer may
+///      name a third-party arbiter — address(0) means none, and the flow
+///      is exactly v1's. After the payee cures a rejected delivery, the
+///      payer may escalate the disputed cure to the arbiter instead of
+///      waiting out the review window; the arbiter decides release or
+///      refund, and while escalated neither party can release. The
+///      arbiter check only compares addresses — it cannot prove the
+///      arbiter is independent — so the payee should read the arbiter
+///      before accepting work and only take escrows whose arbiter it
+///      trusts (see README).
+///      Round 2 (Oct 27, 2026) hardens the arbiter path in five ways:
+///      (1) an arbiter timeout — after 14 days escalated, either party
+///      may force-refund the payer, so a silent arbiter can no longer
+///      stall an escrow forever; (2) the EscrowCreated event now
+///      carries the arbiter, backup arbiter, and bond amount, so
+///      indexers and UIs need no second call; (3) an invariant that
+///      while escalated, neither release nor any refund can succeed;
+///      (4) an OPTIONAL arbiter bond — set at creation, staked by the
+///      arbiter in a separate payable call before escalation, refunded
+///      to the arbiter on every settlement, forfeited to the payer only
+///      when the arbiter it was staked against times out (a backup
+///      arbiter's silence forfeits nothing: the primary arbiter acted,
+///      and the backup staked nothing); (5) an optional backup arbiter
+///      — after the primary arbiter resolves, a 2-day challenge window
+///      opens in which either party may re-escalate to the backup
+///      arbiter for one final decision; if nobody challenges, the
+///      resolution stands and anyone may finalize it. The payout is
+///      deferred while the challenge window is open, so a reversed
+///      decision never has to claw funds back.
 ///   2. Payment splitting — one incoming USDC payment split across up to 5
 ///      recipients in a single transaction, by basis points.
-/// @dev Storage is packed: the Escrow struct fits in 4 slots (was 8) —
+/// @dev Storage is packed: the Escrow struct fits in 7 slots (was 8 in
+///   the first draft, 4 in v1 rounds 5-9, 5 in v2 round 1) —
 ///   amount is uint96, deadline / deliveredAt / rejectedAt are uint40,
 ///   and "delivered" is deliveredAt != 0 rather than a separate bool.
 ///   rejectedOnce caps rejections at one per escrow, deadlineExtended
-///   caps the deadline extension at one use. Amounts above 2**96 wei
+///   caps the deadline extension at one use. V2 adds `escalated` and
+///   `challengeOpen` (bools in slot 2, now 221 of 256 bits) and
+///   `arbiter` (slot 4); round 2 adds `backupArbiter` + `bondAmount`
+///   (slot 5, 160 + 96 = 256 bits exactly) and `escalatedAt` /
+///   `resolvedAt` / `resolvedToPayee` / `bondStaked` / `challenged`
+///   (slot 6, 83 bits). `challengeOpen` sits in slot 2 deliberately:
+///   release() already reads slot 2, so the challenge guard costs no
+///   extra cold SLOAD before the payout gas check.
+///   Amounts above 2**96 wei
 ///   (~7.9e10 native token) revert in createEscrow; a deadline past
 ///   2**40 seconds (~year 34828) is likewise rejected. Timestamps are
 ///   uint40 because no escrow deadline can ever approach 2**40 seconds.
@@ -62,11 +99,18 @@ pragma solidity ^0.8.24;
 ///   project https://studio.arc.io/app/16fcd6f7-5614-4e37-aee6-ad6575f83d73;
 ///   pre-revision reference copy at studio-contract-reference.sol).
 ///   Revert strings are used consistently for validation and failed withdrawals:
-///   "Reentrant call", "Invalid payee", "Zero payment", "Amount too large",
+///   "Reentrant call", "Invalid payee", "Invalid arbiter", "Zero payment", "Amount too large",
 ///   "Invalid deadline", "Invalid extension", "Deadline already extended",
-///   "Escrow not found", "Only payee", "Only payer",
+///   "Escrow not found", "Only payee", "Only payer", "Only arbiter",
+///   "Only backup arbiter", "Only party",
 ///   "Already settled", "Already delivered", "Already rejected",
-///   "Empty work hash", "Deadline passed", "Not delivered", "Not rejected",
+///   "Already escalated", "Already challenged", "Empty work hash", "Deadline passed",
+///   "Not delivered", "Not rejected", "Not resolved",
+///   "Not cured", "Not escalated", "No arbiter", "No backup arbiter", "Disputed",
+///   "Resolution pending", "Bond not staked", "No bond set",
+///   "Wrong bond amount", "Bond already staked", "Invalid backup arbiter",
+///   "Arbiter timeout not reached", "Challenge period ended",
+///   "Challenge period not ended",
 ///   "Deadline not reached", "Review period not ended", "Review period ended",
 ///   "Cure period not ended", "Cure period ended", "Payment failed",
 ///   "Nothing to withdraw",
@@ -78,8 +122,9 @@ contract LamplightEscrow {
     struct Escrow {
         address payer; // slot 0
         address payee; // slot 1
-        // slot 2 (240 of 256 bits): amount + deadline + deliveredAt +
-        //   rejectedAt + settled + rejectedOnce + deadlineExtended.
+        // slot 2 (221 of 256 bits): amount + deadline + deliveredAt +
+        //   rejectedAt + settled + rejectedOnce + deadlineExtended +
+        //   escalated + challengeOpen.
         // delivered == (deliveredAt != 0); there is no separate bool.
         uint96 amount;
         uint40 deadline;
@@ -88,10 +133,26 @@ contract LamplightEscrow {
         bool settled;
         bool rejectedOnce; // a rejection already happened; caps rejections at one
         bool deadlineExtended; // the one-time deadline extension was used
+        bool escalated; // the payer escalated a disputed cure to the arbiter
+        bool challengeOpen; // the arbiter resolved and the challenge window is open
         bytes32 workHash; // slot 3
+        address arbiter; // slot 4: optional third-party arbiter, address(0) = none
+        // slot 5 (256 of 256 bits): backup arbiter + bond amount.
+        address backupArbiter; // optional second arbiter for a post-resolution challenge
+        uint96 bondAmount; // optional arbiter bond, 0 = no bond
+        // slot 6 (83 of 256 bits): dispute clocks and flags.
+        uint40 escalatedAt; // when the dispute was (re-)escalated; arbiter-timeout clock
+        uint40 resolvedAt; // when the arbiter resolved; challenge-window clock
+        bool resolvedToPayee; // the arbiter's recorded decision, pending finalization
+        bool bondStaked; // the arbiter posted the bond
+        bool challenged; // re-escalated to the backup arbiter
     }
 
-    mapping(uint256 => Escrow) public escrows;
+    /// @dev The escrows mapping is internal, not public: with 19 struct
+    ///   fields, Solidity's auto-generated public getter cannot compile
+    ///   (solc "stack too deep" in the tuple ABI encoding). getEscrow()
+    ///   below is the read path and returns the same struct.
+    mapping(uint256 => Escrow) internal escrows;
     mapping(address => uint256) public pendingWithdrawals;
     uint256 public nextEscrowId;
     bool private entered;
@@ -132,15 +193,41 @@ contract LamplightEscrow {
     ///   after delivery or at/after the deadline, and the increase is capped.
     uint256 public constant MAX_DEADLINE_EXTENSION = 7 days;
 
+    /// @dev Arbiter timeout (round 2, Oct 27, 2026): after this long
+    ///   escalated with no resolution, either party may force-refund the
+    ///   payer via resolveDisputeTimeout(). 14 days is twice the review
+    ///   window — long enough that a merely slow arbiter is never cut
+    ///   off, short enough that a silent one cannot stall an escrow
+    ///   indefinitely. The clock restarts if the dispute is re-escalated
+    ///   to the backup arbiter.
+    uint256 public constant ARBITER_TIMEOUT = 14 days;
+
+    /// @dev Post-resolution challenge window (round 2, Oct 27, 2026):
+    ///   after the primary arbiter resolves, either party has this long
+    ///   to re-escalate to the backup arbiter. 2 days — shorter than the
+    ///   7-day review window, long enough for a party watching the
+    ///   escrow to react. Only applies when a backup arbiter was named.
+    uint256 public constant CHALLENGE_PERIOD = 2 days;
+
     event EscrowCreated(
         uint256 indexed id,
         address indexed payer,
         address indexed payee,
         uint256 amount,
-        uint256 deadline
+        uint256 deadline,
+        address arbiter,
+        address backupArbiter,
+        uint256 bondAmount
     );
     event Delivered(uint256 indexed id, bytes32 workHash);
     event DeliveryRejected(uint256 indexed id, address indexed payer, bytes32 rejectedWorkHash);
+    event DisputeEscalated(uint256 indexed id, address indexed payer, address indexed arbiter);
+    event DisputeResolved(uint256 indexed id, address indexed arbiter, bool releasedToPayee);
+    event DisputeTimedOut(uint256 indexed id, address indexed caller);
+    event DisputeChallenged(uint256 indexed id, address indexed challenger, address indexed backupArbiter);
+    event BondStaked(uint256 indexed id, address indexed arbiter, uint256 amount);
+    event BondReturned(uint256 indexed id, address indexed arbiter, uint256 amount);
+    event BondForfeited(uint256 indexed id, address indexed payer, uint256 amount);
     event DeadlineExtended(uint256 indexed id, uint256 newDeadline);
     event Released(uint256 indexed id, address indexed payee, uint256 amount);
     event Refunded(uint256 indexed id, address indexed payer, uint256 amount);
@@ -159,31 +246,114 @@ contract LamplightEscrow {
     /// @dev Amounts above 2**96 wei revert ("Amount too large"); deadlines
     ///   past 2**40 seconds revert as "Invalid deadline". Both bounds are
     ///   far above any real escrow and exist only so the packed struct
-    ///   can never truncate a value.
+    ///   can never truncate a value. No arbiter: the flow is exactly v1's.
     /// @param payee Recipient entitled to deliver work and receive a released payment.
     /// @param deadline Earliest timestamp for a refund if work has not been delivered.
     /// @return id The newly created escrow identifier, starting at zero.
     function createEscrow(address payee, uint256 deadline) external payable returns (uint256 id) {
+        return _createEscrow(payee, deadline, address(0), address(0), 0);
+    }
+
+    /// @notice Fund an escrow with an optional third-party arbiter.
+    /// @dev The arbiter overload of createEscrow: same as the two-argument
+    ///   version, plus an arbiter the payer may escalate a disputed cure
+    ///   to (see escalateDispute). The arbiter must be a third party —
+    ///   not the payer, not the payee, not this contract — but the check
+    ///   only compares addresses and cannot prove independence, so the
+    ///   payee should read the arbiter before accepting work.
+    /// @param payee Recipient entitled to deliver work and receive a released payment.
+    /// @param deadline Earliest timestamp for a refund if work has not been delivered.
+    /// @param arbiter Third-party arbiter for disputed cures, or address(0) for none.
+    /// @return id The newly created escrow identifier, starting at zero.
+    function createEscrow(address payee, uint256 deadline, address arbiter)
+        external
+        payable
+        returns (uint256 id)
+    {
+        return _createEscrow(payee, deadline, arbiter, address(0), 0);
+    }
+
+    /// @notice Fund an escrow with an arbiter, an optional backup arbiter,
+    ///   and an optional arbiter bond.
+    /// @dev The full round-2 overload: same as the three-argument version,
+    ///   plus a backup arbiter the dispute may be re-escalated to after
+    ///   the primary arbiter resolves (see reEscalate), and a bond amount
+    ///   the arbiter must stake before escalation (see stakeBond).
+    ///   The backup arbiter must be a third party like the arbiter, must
+    ///   differ from the arbiter, and requires an arbiter to be set at
+    ///   all; a nonzero bond likewise requires an arbiter. All three
+    ///   arbiter terms are emitted in EscrowCreated so indexers and UIs
+    ///   can surface them without a second call.
+    /// @param payee Recipient entitled to deliver work and receive a released payment.
+    /// @param deadline Earliest timestamp for a refund if work has not been delivered.
+    /// @param arbiter Third-party arbiter for disputed cures, or address(0) for none.
+    /// @param backupArbiter Second arbiter for a post-resolution challenge, or address(0) for none.
+    /// @param bondAmount Optional bond the arbiter must stake before escalation (0 = no bond).
+    /// @return id The newly created escrow identifier, starting at zero.
+    function createEscrow(
+        address payee,
+        uint256 deadline,
+        address arbiter,
+        address backupArbiter,
+        uint96 bondAmount
+    ) external payable returns (uint256 id) {
+        return _createEscrow(payee, deadline, arbiter, backupArbiter, bondAmount);
+    }
+
+    /// @dev Validate the arbiter terms of a new escrow. Split out of
+    ///   _createEscrow so the boolean chains live in their own stack
+    ///   frame (solc's "stack too deep" fires when they share the
+    ///   creation frame with the storage writes).
+    function _validateArbiterTerms(
+        address payee,
+        address arbiter,
+        address backupArbiter,
+        uint96 bondAmount
+    ) internal view {
+        require(
+            arbiter == address(0) ||
+                (arbiter != msg.sender && arbiter != payee && arbiter != address(this)),
+            "Invalid arbiter"
+        );
+        require(
+            backupArbiter == address(0) ||
+                (arbiter != address(0) &&
+                    backupArbiter != msg.sender &&
+                    backupArbiter != payee &&
+                    backupArbiter != address(this) &&
+                    backupArbiter != arbiter),
+            "Invalid backup arbiter"
+        );
+        require(bondAmount == 0 || arbiter != address(0), "No arbiter");
+    }
+
+    /// @dev Shared creation logic for all createEscrow overloads.
+    function _createEscrow(
+        address payee,
+        uint256 deadline,
+        address arbiter,
+        address backupArbiter,
+        uint96 bondAmount
+    ) internal returns (uint256 id) {
         require(payee != address(0) && payee != msg.sender && payee != address(this), "Invalid payee");
+        _validateArbiterTerms(payee, arbiter, backupArbiter, bondAmount);
         require(msg.value > 0, "Zero payment");
         require(msg.value <= type(uint96).max, "Amount too large");
         require(deadline > block.timestamp && deadline <= type(uint40).max, "Invalid deadline");
 
         id = nextEscrowId;
-        escrows[id] = Escrow({
-            payer: msg.sender,
-            payee: payee,
-            amount: uint96(msg.value),
-            deadline: uint40(deadline),
-            workHash: bytes32(0),
-            deliveredAt: 0,
-            settled: false,
-            rejectedAt: 0,
-            rejectedOnce: false,
-            deadlineExtended: false
-        });
+        // Field-by-field storage writes, not a struct literal: the
+        // literal form hits solc's "stack too deep" with 19 fields.
+        Escrow storage e = escrows[id];
+        e.payer = msg.sender;
+        e.payee = payee;
+        e.amount = uint96(msg.value);
+        e.deadline = uint40(deadline);
+        e.arbiter = arbiter;
+        e.backupArbiter = backupArbiter;
+        e.bondAmount = bondAmount;
         nextEscrowId = id + 1;
-        emit EscrowCreated(id, msg.sender, payee, msg.value, deadline);
+        emit EscrowCreated(id, msg.sender, payee, msg.value, deadline, arbiter, backupArbiter, bondAmount);
     }
 
     /// @notice Record delivery once, as the payee of an unsettled escrow,
@@ -277,6 +447,218 @@ contract LamplightEscrow {
         escrow.settled = true;
         _payOrCredit(escrow.payer, escrow.amount);
         emit Refunded(id, escrow.payer, escrow.amount);
+        _settleBond(escrow, id, false);
+    }
+
+    /// @notice Stake the arbiter bond for an escrow that named one.
+    /// @dev Only the escrow's arbiter, only the exact bond amount set at
+    ///   creation, only once, and only before escalation — escalation
+    ///   requires the bond when one was set, so a late stake is useless
+    ///   after the dispute is already with the arbiter. The bond is held
+    ///   by the contract until the escrow settles: it returns to the
+    ///   arbiter on every settlement except an arbiter timeout, where it
+    ///   is forfeited to the payer (see resolveDisputeTimeout). If the
+    ///   escrow settles without any escalation — a normal release or
+    ///   refund — the bond is returned to the arbiter too, so it can
+    ///   never strand. A failed payout credits the arbiter for
+    ///   withdrawal, like every other payout in this contract.
+    /// @param id Existing, unsettled, un-escalated escrow identifier.
+    function stakeBond(uint256 id) external payable nonReentrant {
+        Escrow storage escrow = escrows[id];
+        require(escrow.payer != address(0), "Escrow not found");
+        require(msg.sender == escrow.arbiter, "Only arbiter");
+        require(!escrow.settled, "Already settled");
+        require(!escrow.escalated, "Already escalated");
+        require(escrow.bondAmount > 0, "No bond set");
+        require(!escrow.bondStaked, "Bond already staked");
+        require(msg.value == escrow.bondAmount, "Wrong bond amount");
+
+        escrow.bondStaked = true;
+        emit BondStaked(id, msg.sender, msg.value);
+    }
+
+    /// @notice Escalate a disputed cure to the escrow's arbiter.
+    /// @dev Only the payer, only after the payee cured a rejected delivery
+    ///   (rejectedOnce set and delivered again), only while the review
+    ///   window is still open, and only when an arbiter was set at
+    ///   creation. When a bond was set at creation, the arbiter must
+    ///   have staked it first — an unstaked bond blocks escalation, so
+    ///   the payer cannot escalate to an arbiter who has not put money
+    ///   behind acting. While escalated, neither party can release — only
+    ///   the arbiter resolves, or either party times it out after
+    ///   ARBITER_TIMEOUT (see resolveDisputeTimeout). The arbiter is
+    ///   whoever the payer named; the check cannot prove independence,
+    ///   so the payee should have read the arbiter before accepting the
+    ///   work.
+    /// @param id Existing, delivered, unsettled escrow identifier.
+    function escalateDispute(uint256 id) external nonReentrant {
+        Escrow storage escrow = escrows[id];
+        require(escrow.payer != address(0), "Escrow not found");
+        require(msg.sender == escrow.payer, "Only payer");
+        require(!escrow.settled, "Already settled");
+        require(escrow.arbiter != address(0), "No arbiter");
+        require(escrow.rejectedOnce, "Not rejected");
+        require(escrow.deliveredAt != 0, "Not delivered");
+        require(!escrow.escalated, "Already escalated");
+        require(!escrow.challengeOpen, "Resolution pending");
+        require(escrow.bondAmount == 0 || escrow.bondStaked, "Bond not staked");
+        require(block.timestamp < escrow.deliveredAt + REVIEW_PERIOD, "Review period ended");
+
+        escrow.escalated = true;
+        escrow.escalatedAt = uint40(block.timestamp);
+        emit DisputeEscalated(id, msg.sender, escrow.arbiter);
+    }
+
+    /// @notice Resolve an escalated dispute: release to the payee or refund the payer.
+    /// @dev Only the escrow's arbiter — or, after a re-escalation, only
+    ///   the backup arbiter — only while escalated, only once per
+    ///   escalation. True pays the full amount to the payee; false
+    ///   refunds the full amount to the payer. A failed payout credits
+    ///   the recipient for withdrawal; the escrow remains settled.
+    ///   When a backup arbiter was named, the FIRST resolution does NOT
+    ///   pay out and does NOT settle: it records the decision and opens
+    ///   the CHALLENGE_PERIOD window, so either party may re-escalate
+    ///   to the backup arbiter (see reEscalate) and the payout is
+    ///   deferred until the challenge is answered or the window closes
+    ///   (see finalizeResolution). A resolution by the backup arbiter
+    ///   is final — it pays out immediately and settles, with no
+    ///   further challenge. The staked bond, if any, returns to the
+    ///   arbiter on every resolution except a timeout forfeit.
+    /// @param id Existing, escalated, unsettled escrow identifier.
+    /// @param releaseToPayee True pays the payee; false refunds the payer.
+    function resolveDispute(uint256 id, bool releaseToPayee) external nonReentrant {
+        Escrow storage escrow = escrows[id];
+        require(escrow.payer != address(0), "Escrow not found");
+        if (escrow.challenged) {
+            require(msg.sender == escrow.backupArbiter, "Only backup arbiter");
+        } else {
+            require(msg.sender == escrow.arbiter, "Only arbiter");
+        }
+        require(!escrow.settled, "Already settled");
+        require(escrow.escalated, "Not escalated");
+
+        if (!escrow.challenged && escrow.backupArbiter != address(0)) {
+            // First resolution with a backup arbiter named: record the
+            // decision and open the challenge window instead of paying.
+            // The bond stays staked until the challenge is answered or
+            // the window closes and the resolution is finalized.
+            escrow.escalated = false;
+            escrow.challengeOpen = true;
+            escrow.resolvedAt = uint40(block.timestamp);
+            escrow.resolvedToPayee = releaseToPayee;
+            emit DisputeResolved(id, msg.sender, releaseToPayee);
+            return;
+        }
+
+        escrow.settled = true;
+        escrow.escalated = false;
+        escrow.challengeOpen = false;
+        escrow.resolvedAt = 0;
+        if (releaseToPayee) {
+            _payOrCredit(escrow.payee, escrow.amount);
+            emit Released(id, escrow.payee, escrow.amount);
+        } else {
+            _payOrCredit(escrow.payer, escrow.amount);
+            emit Refunded(id, escrow.payer, escrow.amount);
+        }
+        _settleBond(escrow, id, false);
+        emit DisputeResolved(id, msg.sender, releaseToPayee);
+    }
+
+    /// @notice Force-refund an escrow whose arbiter has been silent too long.
+    /// @dev Either party — payer or payee — only while escalated, only
+    ///   once ARBITER_TIMEOUT (14 days) has passed since the (re-)escalation.
+    ///   The full escrow amount refunds to the payer and the escrow
+    ///   settles; the arbiter can no longer resolve it. The bond is
+    ///   forfeited to the payer when the SILENT arbiter is the one who
+    ///   staked it — i.e. a timeout of the primary arbiter. If the
+    ///   dispute was re-escalated and the BACKUP arbiter timed out, the
+    ///   bond returns to the primary arbiter instead: it resolved in
+    ///   time, the stall is the backup's fault, and the backup staked
+    ///   nothing. A failed payout credits the recipient for withdrawal.
+    /// @param id Existing, escalated, unsettled escrow identifier.
+    function resolveDisputeTimeout(uint256 id) external nonReentrant {
+        Escrow storage escrow = escrows[id];
+        require(escrow.payer != address(0), "Escrow not found");
+        require(msg.sender == escrow.payer || msg.sender == escrow.payee, "Only party");
+        require(!escrow.settled, "Already settled");
+        require(escrow.escalated, "Not escalated");
+        require(
+            block.timestamp >= escrow.escalatedAt + ARBITER_TIMEOUT,
+            "Arbiter timeout not reached"
+        );
+
+        bool forfeitBond = !escrow.challenged;
+        escrow.settled = true;
+        escrow.escalated = false;
+        escrow.challengeOpen = false;
+        escrow.resolvedAt = 0;
+        _payOrCredit(escrow.payer, escrow.amount);
+        emit Refunded(id, escrow.payer, escrow.amount);
+        _settleBond(escrow, id, forfeitBond);
+        emit DisputeTimedOut(id, msg.sender);
+    }
+
+    /// @notice Re-escalate a resolved dispute to the backup arbiter.
+    /// @dev Either party — payer or payee — only inside the
+    ///   CHALLENGE_PERIOD (2 days) after the primary arbiter resolved,
+    ///   only when a backup arbiter was named at creation, and only
+    ///   once: a second challenge reverts. Re-escalation re-opens the
+    ///   dispute for the backup arbiter and restarts the arbiter-timeout
+    ///   clock from now (see resolveDisputeTimeout). The backup
+    ///   arbiter's resolution is final — no further challenge, no
+    ///   further escalation. While re-escalated, release and refund
+    ///   stay blocked exactly as while escalated.
+    /// @param id Existing, resolved, unsettled escrow identifier.
+    function reEscalate(uint256 id) external nonReentrant {
+        Escrow storage escrow = escrows[id];
+        require(escrow.payer != address(0), "Escrow not found");
+        require(msg.sender == escrow.payer || msg.sender == escrow.payee, "Only party");
+        require(!escrow.settled, "Already settled");
+        require(escrow.backupArbiter != address(0), "No backup arbiter");
+        require(!escrow.challenged, "Already challenged");
+        require(escrow.challengeOpen, "Not resolved");
+        require(block.timestamp < escrow.resolvedAt + CHALLENGE_PERIOD, "Challenge period ended");
+
+        escrow.challenged = true;
+        escrow.escalated = true;
+        escrow.challengeOpen = false;
+        escrow.escalatedAt = uint40(block.timestamp);
+        escrow.resolvedAt = 0;
+        emit DisputeChallenged(id, msg.sender, escrow.backupArbiter);
+    }
+
+    /// @notice Finalize an unchallenged arbiter resolution after the challenge window closes.
+    /// @dev Anyone may call it — finalization pays the recorded decision
+    ///   to the recorded winner regardless of who triggers it, so there
+    ///   is nothing to grief. Only when a resolution is pending
+    ///   (challengeOpen) and the CHALLENGE_PERIOD has passed. The staked
+    ///   bond, if any, returns to the arbiter. If a backup arbiter was
+    ///   never named, resolveDispute pays out immediately and this
+    ///   function is never needed.
+    /// @param id Existing, resolved, unsettled escrow identifier.
+    function finalizeResolution(uint256 id) external nonReentrant {
+        Escrow storage escrow = escrows[id];
+        require(escrow.payer != address(0), "Escrow not found");
+        require(!escrow.settled, "Already settled");
+        require(escrow.challengeOpen, "Not resolved");
+        require(
+            block.timestamp >= escrow.resolvedAt + CHALLENGE_PERIOD,
+            "Challenge period not ended"
+        );
+
+        bool releaseToPayee = escrow.resolvedToPayee;
+        escrow.settled = true;
+        escrow.challengeOpen = false;
+        escrow.resolvedAt = 0;
+        if (releaseToPayee) {
+            _payOrCredit(escrow.payee, escrow.amount);
+            emit Released(id, escrow.payee, escrow.amount);
+        } else {
+            _payOrCredit(escrow.payer, escrow.amount);
+            emit Refunded(id, escrow.payer, escrow.amount);
+        }
+        _settleBond(escrow, id, false);
     }
 
     /// @notice Release the full delivered escrow amount to its payee.
@@ -285,6 +667,9 @@ contract LamplightEscrow {
     ///   also release, so a silent payer cannot lock the funds forever.
     ///   Before the window ends, only the payer can release. A failed
     ///   payout credits the payee for withdrawal; the escrow remains settled.
+    ///   While a resolution is pending its challenge window, release is
+    ///   blocked — the arbiter's recorded decision stands until it is
+    ///   challenged or finalized. A staked bond returns to the arbiter.
     /// @param id Existing, delivered, unsettled escrow identifier.
     function release(uint256 id) external nonReentrant {
         Escrow storage escrow = escrows[id];
@@ -298,11 +683,14 @@ contract LamplightEscrow {
             require(msg.sender == escrow.payer, "Only payer");
         }
         require(!escrow.settled, "Already settled");
+        require(!escrow.escalated, "Disputed");
+        require(!escrow.challengeOpen, "Resolution pending");
         require(escrow.deliveredAt != 0, "Not delivered");
 
         escrow.settled = true;
         _payOrCredit(escrow.payee, escrow.amount);
         emit Released(id, escrow.payee, escrow.amount);
+        _settleBond(escrow, id, false);
     }
 
     /// @notice Refund an undelivered escrow to its payer at or after its deadline.
@@ -326,6 +714,7 @@ contract LamplightEscrow {
         escrow.settled = true;
         _payOrCredit(escrow.payer, escrow.amount);
         emit Refunded(id, escrow.payer, escrow.amount);
+        _settleBond(escrow, id, false);
     }
 
     /// @notice Extend an undelivered escrow's deadline once, by at most 7 days.
@@ -406,7 +795,13 @@ contract LamplightEscrow {
     ///   review window over (payee may claim); CureOpen = rejected,
     ///   cure window still open (payee may re-deliver); Rejected =
     ///   rejected, cure window over (payer may refundAfterRejection);
-    ///   Settled = released or refunded.
+    ///   Settled = released or refunded. Escalated = delivered, cured,
+    ///   and escalated to the arbiter (neither party can release; only
+    ///   the arbiter resolves, or either party times it out after
+    ///   ARBITER_TIMEOUT). ChallengeOpen = the arbiter resolved and the
+    ///   challenge window is open (either party may re-escalate to the
+    ///   backup arbiter, or the resolution is finalized once the window
+    ///   closes; release stays blocked meanwhile).
     enum Lifecycle {
         Nonexistent,
         Created,
@@ -415,7 +810,9 @@ contract LamplightEscrow {
         Claimable,
         CureOpen,
         Rejected,
-        Settled
+        Settled,
+        Escalated,
+        ChallengeOpen
     }
 
     /// @notice Read an escrow's lifecycle state.
@@ -431,6 +828,8 @@ contract LamplightEscrow {
         Escrow storage escrow = escrows[id];
         if (escrow.payer == address(0)) return Lifecycle.Nonexistent;
         if (escrow.settled) return Lifecycle.Settled;
+        if (escrow.escalated) return Lifecycle.Escalated;
+        if (escrow.challengeOpen) return Lifecycle.ChallengeOpen;
         if (escrow.rejectedAt != 0) {
             return block.timestamp < escrow.rejectedAt + REJECT_CURE_PERIOD
                 ? Lifecycle.CureOpen
@@ -511,6 +910,23 @@ contract LamplightEscrow {
             }
         }
         emit SplitPaid(msg.sender, msg.value, count);
+    }
+
+    /// @dev Return a staked bond to the arbiter on settlement, or forfeit
+    ///   it to the payer when the arbiter it was staked against timed
+    ///   out. No-op when no bond was staked. A failed payout credits the
+    ///   recipient for withdrawal, like every other payout here — so a
+    ///   reverting arbiter's bond is never lost, only pullable.
+    function _settleBond(Escrow storage escrow, uint256 id, bool forfeitToPayer) internal {
+        if (!escrow.bondStaked) return;
+        escrow.bondStaked = false;
+        if (forfeitToPayer) {
+            _payOrCredit(escrow.payer, escrow.bondAmount);
+            emit BondForfeited(id, escrow.payer, escrow.bondAmount);
+        } else {
+            _payOrCredit(escrow.arbiter, escrow.bondAmount);
+            emit BondReturned(id, escrow.arbiter, escrow.bondAmount);
+        }
     }
 
     /// @dev Attempt a native-token payout, crediting the recipient if its call fails.

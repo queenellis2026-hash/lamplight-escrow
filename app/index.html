@@ -130,8 +130,8 @@
     <table>
       <tr><td><b>Escrow</b></td><td><span class="mono">createEscrow(payee, deadline) payable</span> → <span class="mono">deliver(id, workHash)</span> → <span class="mono">release(id)</span> · or <span class="mono">refund(id)</span> after the deadline if undelivered.</td></tr>
       <tr><td><b>Split</b></td><td><span class="mono">splitPayment(recipients, sharesBps) payable</span> — shares sum to 10,000 bps; last recipient takes rounding dust.</td></tr>
-      <tr><td><b>Safety</b></td><td>Reentrancy guard; checks-effects-interactions; only payer can release/refund; only payee can deliver; plain transfers are rejected so funds always arrive through a tracked function; 14 Foundry tests pass.</td></tr>
-      <tr><td><b>Limits (v1)</b></td><td>No arbitrator — if payer and payee disagree after delivery, the payer still holds the release. A dispute role is the next version.</td></tr>
+      <tr><td><b>Safety</b></td><td>Reentrancy guard; checks-effects-interactions; only payer can release/refund; only payee can deliver; plain transfers are rejected so funds always arrive through a tracked function; 130 Foundry tests pass.</td></tr>
+      <tr><td><b>Limits (v2)</b></td><td>Optional arbiter: the payer may name a third-party arbiter at creation; on a disputed cure the arbiter decides (a silent arbiter costs at most 14 days). Without an arbiter, a disputed cure still resolves by the 7-day review window.</td></tr>
     </table>
   </div>
 

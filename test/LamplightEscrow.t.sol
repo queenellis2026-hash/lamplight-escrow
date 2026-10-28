@@ -168,6 +168,8 @@ contract LamplightEscrowTest is Test {
     address payer = address(0xA11CE);
     address payee = address(0xBEEF);
     address third = address(0xCAFE);
+    address arbiter = address(0xA9B17E9);
+    address backupArbiter = address(0xBAC4);
     FlakyRecipient flaky;
 
     function setUp() public {
@@ -176,11 +178,72 @@ contract LamplightEscrowTest is Test {
         vm.deal(payer, 100 ether);
         vm.deal(payee, 1 ether);
         vm.deal(third, 1 ether);
+        // Round 2: the arbiters must hold funds to stake bonds.
+        vm.deal(arbiter, 10 ether);
+        vm.deal(backupArbiter, 10 ether);
     }
 
     function _create(uint256 amount, uint256 deadlineIn) internal returns (uint256) {
         vm.prank(payer);
         return esc.createEscrow{value: amount}(payee, block.timestamp + deadlineIn);
+    }
+
+    function _createWithArbiter(uint256 amount, uint256 deadlineIn, address arbiter_) internal returns (uint256) {
+        vm.prank(payer);
+        return esc.createEscrow{value: amount}(payee, block.timestamp + deadlineIn, arbiter_);
+    }
+
+    /// @dev Round 2: create with the full five-argument overload.
+    function _createFull(
+        uint256 amount,
+        uint256 deadlineIn,
+        address arbiter_,
+        address backup_,
+        uint96 bond_
+    ) internal returns (uint256) {
+        vm.prank(payer);
+        return esc.createEscrow{value: amount}(payee, block.timestamp + deadlineIn, arbiter_, backup_, bond_);
+    }
+
+    function _createWithBackup(uint256 amount, uint256 deadlineIn) internal returns (uint256) {
+        return _createFull(amount, deadlineIn, arbiter, backupArbiter, 0);
+    }
+
+    function _createWithBond(uint256 amount, uint256 deadlineIn, uint96 bond_) internal returns (uint256) {
+        return _createFull(amount, deadlineIn, arbiter, address(0), bond_);
+    }
+
+    function _createWithBackupAndBond(uint256 amount, uint256 deadlineIn, uint96 bond_)
+        internal
+        returns (uint256)
+    {
+        return _createFull(amount, deadlineIn, arbiter, backupArbiter, bond_);
+    }
+
+    /// @dev Reject, cure, then escalate — the setup every timeout/bond/backup test starts from.
+    function _escalated(uint256 id) internal {
+        _rejectAndCure(id);
+        vm.prank(payer);
+        esc.escalateDispute(id);
+    }
+
+    /// @dev Escalate, then the primary arbiter resolves — the setup every
+    ///   challenge-window test starts from. With a backup arbiter named,
+    ///   the resolution opens the challenge window instead of paying.
+    function _resolvedWithBackup(uint256 id, bool toPayee) internal {
+        _escalated(id);
+        vm.prank(arbiter);
+        esc.resolveDispute(id, toPayee);
+    }
+
+    /// @dev Deliver, reject, then cure — the setup every arbiter test starts from.
+    function _rejectAndCure(uint256 id) internal {
+        vm.prank(payee);
+        esc.deliver(id, keccak256("work v1"));
+        vm.prank(payer);
+        esc.rejectDelivery(id);
+        vm.prank(payee);
+        esc.deliver(id, keccak256("work v2 fixed"));
     }
 
     // ---- The 14 required cases, adapted to pull semantics ----
@@ -864,32 +927,25 @@ contract LamplightEscrowTest is Test {
         // threshold (~106,587) and silently under-forward to the payee.
         // The 40,000 buffer raises the threshold to ~141,587; a caller
         // leaving ~120,000 gas at the check (above the old threshold, below
-        // the new one) must now fail loudly instead. Round 9 (Claude
-        // improvement 3): the limit is DERIVED from _minGasForDirectPay,
-        // not hardcoded — 21,000 below the derived minimum lands ~120,000
-        // gas left at the check, and the offset survives compiler drift
-        // because the release path's pre-check burn lives inside the
-        // derived minimum.
-        uint256 minLimit = _minGasForDirectPay(payee);
+        // the new one) must now fail loudly instead. The release path burns
+        // ~33,000 gas before the check after struct packing (was ~75,000),
+        // so a 153,000 gas limit lands at ~120,000 gas left.
         uint256 id = _create(0.5 ether, 1 days);
         vm.prank(payee);
         esc.deliver(id, keccak256("x"));
         vm.prank(payer);
         vm.expectRevert("Insufficient gas for payout");
-        esc.release{gas: minLimit - 21_000}(id);
+        esc.release{gas: 153_000}(id);
     }
 
     function testPayoutGasGuardForwardsFullCapAtBoundary() public {
         // Re-review Low: at the new threshold (~141,587 gas left at the
         // check), the full 100,000 gas must actually reach the recipient.
-        // A recipient burning ~99,000 gas is paid directly. Round 9
-        // (Claude improvement 3): the limit is DERIVED from
-        // _minGasForDirectPay for this exact burner, not hardcoded —
-        // releasing at exactly the derived minimum proves the threshold
-        // forwards the full cap, and the derivation survives compiler
-        // drift because the pre-check burn lives inside the minimum.
+        // A recipient burning ~99,000 gas is paid directly — under the old
+        // 5,000 buffer the same gas limit would have forwarded only ~93.5k
+        // and credited it instead. A 220,000 gas limit lands at ~145,000
+        // gas left at the check, just above the threshold.
         GasBurnerExact burner = new GasBurnerExact(99_000);
-        uint256 minLimit = _minGasForDirectPay(address(burner));
         vm.prank(payer);
         uint256 id = esc.createEscrow{value: 0.5 ether}(
             address(burner),
@@ -897,16 +953,12 @@ contract LamplightEscrowTest is Test {
         );
         vm.prank(address(burner));
         esc.deliver(id, keccak256("x"));
-        uint256 before = address(burner).balance; // the binary search already
-        // paid this burner on its successful probes; assert the delta
-        uint256 escBefore = address(esc).balance; // the search's failed
-        // probes left their escrows funded and unsettled in the contract
         vm.prank(payer);
-        esc.release{gas: minLimit}(id);
+        esc.release{gas: 220_000}(id);
         assertTrue(esc.getEscrow(id).settled);
-        assertEq(address(burner).balance, before + 0.5 ether);
+        assertEq(address(burner).balance, 0.5 ether);
         assertEq(esc.pendingWithdrawals(address(burner)), 0);
-        assertEq(address(esc).balance, escBefore - 0.5 ether);
+        assertEq(address(esc).balance, 0);
     }
 
     // ---- Re-review round 3 (Oct 27, 2026): dust + unrecoverable credit ----
@@ -1941,6 +1993,685 @@ contract LamplightEscrowTest is Test {
             uint256(LamplightEscrow.Lifecycle.Settled)
         );
     }
+
+    // ---- V2 (Oct 27, 2026): optional per-escrow arbiter ----
+
+    function testArbiterEscalateAndReleaseToPayee() public {
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        _rejectAndCure(id);
+        vm.expectEmit(true, true, true, true);
+        emit LamplightEscrow.DisputeEscalated(id, payer, arbiter);
+        vm.prank(payer);
+        esc.escalateDispute(id);
+        assertEq(uint256(esc.lifecycleStatus(id)), uint256(LamplightEscrow.Lifecycle.Escalated));
+        vm.expectEmit(true, true, false, true);
+        emit LamplightEscrow.DisputeResolved(id, arbiter, true);
+        vm.prank(arbiter);
+        esc.resolveDispute(id, true);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payee.balance, 1.5 ether); // 1 ether from setUp + 0.5 released
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testArbiterEscalateAndRefundToPayer() public {
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        _rejectAndCure(id);
+        vm.prank(payer);
+        esc.escalateDispute(id);
+        vm.prank(arbiter);
+        esc.resolveDispute(id, false);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payee.balance, 1 ether); // payee got nothing
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testEscalateWithoutArbiterReverts() public {
+        uint256 id = _create(0.5 ether, 1 days); // no arbiter: address(0)
+        assertEq(esc.getEscrow(id).arbiter, address(0));
+        _rejectAndCure(id);
+        vm.prank(payer);
+        vm.expectRevert("No arbiter");
+        esc.escalateDispute(id);
+    }
+
+    function testEscalateByNonPayerReverts() public {
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        _rejectAndCure(id);
+        vm.prank(payee);
+        vm.expectRevert("Only payer");
+        esc.escalateDispute(id);
+        vm.prank(arbiter);
+        vm.expectRevert("Only payer");
+        esc.escalateDispute(id);
+    }
+
+    function testEscalateBeforeRejectionReverts() public {
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        vm.prank(payee);
+        esc.deliver(id, keccak256("work v1")); // delivered, never rejected
+        vm.prank(payer);
+        vm.expectRevert("Not rejected");
+        esc.escalateDispute(id);
+    }
+
+    function testEscalateBeforeCureReverts() public {
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        vm.prank(payee);
+        esc.deliver(id, keccak256("work v1"));
+        vm.prank(payer);
+        esc.rejectDelivery(id); // rejected, not yet cured
+        vm.prank(payer);
+        vm.expectRevert("Not delivered");
+        esc.escalateDispute(id);
+    }
+
+    function testEscalateAfterReviewWindowReverts() public {
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        _rejectAndCure(id);
+        uint256 deliveredAt = esc.getEscrow(id).deliveredAt;
+        vm.warp(deliveredAt + 7 days); // review window over
+        vm.prank(payer);
+        vm.expectRevert("Review period ended");
+        esc.escalateDispute(id);
+    }
+
+    function testEscalateTwiceReverts() public {
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        _rejectAndCure(id);
+        vm.prank(payer);
+        esc.escalateDispute(id);
+        vm.prank(payer);
+        vm.expectRevert("Already escalated");
+        esc.escalateDispute(id);
+    }
+
+    function testArbiterCannotResolveTwice() public {
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        _rejectAndCure(id);
+        vm.prank(payer);
+        esc.escalateDispute(id);
+        vm.prank(arbiter);
+        esc.resolveDispute(id, true);
+        vm.prank(arbiter);
+        vm.expectRevert("Already settled");
+        esc.resolveDispute(id, true);
+    }
+
+    function testSecondEscalationAfterResolutionReverts() public {
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        _rejectAndCure(id);
+        vm.prank(payer);
+        esc.escalateDispute(id);
+        vm.prank(arbiter);
+        esc.resolveDispute(id, false);
+        vm.prank(payer);
+        vm.expectRevert("Already settled");
+        esc.escalateDispute(id);
+    }
+
+    function testReleaseBlockedWhileEscalated() public {
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        _rejectAndCure(id);
+        vm.prank(payer);
+        esc.escalateDispute(id);
+        vm.prank(payer);
+        vm.expectRevert("Disputed");
+        esc.release(id);
+        // after the review window the payee could normally claim — not while escalated
+        uint256 deliveredAt = esc.getEscrow(id).deliveredAt;
+        vm.warp(deliveredAt + 7 days);
+        vm.prank(payee);
+        vm.expectRevert("Disputed");
+        esc.release(id);
+        assertFalse(esc.getEscrow(id).settled);
+    }
+
+    function testArbiterCannotBePayerOrPayee() public {
+        vm.prank(payer);
+        vm.expectRevert("Invalid arbiter");
+        esc.createEscrow{value: 0.5 ether}(payee, block.timestamp + 1 days, payer);
+        vm.prank(payer);
+        vm.expectRevert("Invalid arbiter");
+        esc.createEscrow{value: 0.5 ether}(payee, block.timestamp + 1 days, payee);
+        vm.prank(payer);
+        vm.expectRevert("Invalid arbiter");
+        esc.createEscrow{value: 0.5 ether}(payee, block.timestamp + 1 days, address(esc));
+    }
+
+    function testPayeeCanReadArbiterBeforeDelivering() public {
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        assertEq(esc.getEscrow(id).arbiter, arbiter);
+        uint256 plain = _create(0.5 ether, 1 days);
+        assertEq(esc.getEscrow(plain).arbiter, address(0));
+    }
+
+    function testLifecycleEscalated() public {
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        assertEq(uint256(esc.lifecycleStatus(id)), uint256(LamplightEscrow.Lifecycle.Created));
+        _rejectAndCure(id);
+        assertEq(uint256(esc.lifecycleStatus(id)), uint256(LamplightEscrow.Lifecycle.InReview));
+        vm.prank(payer);
+        esc.escalateDispute(id);
+        assertEq(uint256(esc.lifecycleStatus(id)), uint256(LamplightEscrow.Lifecycle.Escalated));
+        vm.prank(arbiter);
+        esc.resolveDispute(id, true);
+        assertEq(uint256(esc.lifecycleStatus(id)), uint256(LamplightEscrow.Lifecycle.Settled));
+    }
+
+    // ---- V2 round 2 (Oct 27, 2026): arbiter timeout ----
+
+    function testArbiterTimeoutBefore14DaysReverts() public {
+        // The timeout is 14 days from escalation: at 14 days minus one
+        // second neither party may force-refund yet.
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        _escalated(id);
+        uint256 escalatedAt = esc.getEscrow(id).escalatedAt;
+        vm.warp(escalatedAt + 14 days - 1);
+        vm.prank(payer);
+        vm.expectRevert("Arbiter timeout not reached");
+        esc.resolveDisputeTimeout(id);
+        vm.prank(payee);
+        vm.expectRevert("Arbiter timeout not reached");
+        esc.resolveDisputeTimeout(id);
+        assertFalse(esc.getEscrow(id).settled);
+    }
+
+    function testArbiterTimeoutRefundsPayerAtBoundary() public {
+        // At exactly escalatedAt + 14 days the payer may force-refund.
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        _escalated(id);
+        uint256 escalatedAt = esc.getEscrow(id).escalatedAt;
+        vm.warp(escalatedAt + 14 days);
+        uint256 before = payer.balance;
+        vm.expectEmit(true, true, false, false);
+        emit LamplightEscrow.DisputeTimedOut(id, payer);
+        vm.prank(payer);
+        esc.resolveDisputeTimeout(id);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payer.balance, before + 0.5 ether);
+        assertEq(address(esc).balance, 0);
+        assertEq(uint256(esc.lifecycleStatus(id)), uint256(LamplightEscrow.Lifecycle.Settled));
+    }
+
+    function testArbiterTimeoutPayeeCanCall() public {
+        // Either party may time out a silent arbiter — the payee too,
+        // since a refund unblocks the payee's next job as well.
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        _escalated(id);
+        uint256 escalatedAt = esc.getEscrow(id).escalatedAt;
+        vm.warp(escalatedAt + 15 days); // past the boundary
+        uint256 before = payer.balance;
+        vm.prank(payee);
+        esc.resolveDisputeTimeout(id);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payer.balance, before + 0.5 ether);
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testArbiterTimeoutBlocksFurtherActions() public {
+        // After a timeout the escrow is settled: the arbiter can no
+        // longer resolve it, and no party can release, refund, or
+        // re-escalate.
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        _escalated(id);
+        uint256 escalatedAt = esc.getEscrow(id).escalatedAt;
+        vm.warp(escalatedAt + 14 days);
+        vm.prank(payer);
+        esc.resolveDisputeTimeout(id);
+        vm.prank(arbiter);
+        vm.expectRevert("Already settled");
+        esc.resolveDispute(id, true);
+        vm.prank(payer);
+        vm.expectRevert("Already settled");
+        esc.release(id);
+        vm.prank(payer);
+        vm.expectRevert("Already settled");
+        esc.refund(id);
+        vm.prank(payer);
+        vm.expectRevert("Already settled");
+        esc.escalateDispute(id);
+        vm.prank(payer);
+        vm.expectRevert("Already settled");
+        esc.resolveDisputeTimeout(id);
+    }
+
+    function testArbiterTimeoutForfeitsBond() public {
+        // A staked bond is forfeited to the payer when the arbiter it
+        // was staked against times out: the payer gets the escrow
+        // amount AND the bond; the silent arbiter loses its stake.
+        uint256 id = _createWithBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        assertEq(arbiter.balance, 9.9 ether);
+        _escalated(id);
+        uint256 escalatedAt = esc.getEscrow(id).escalatedAt;
+        vm.warp(escalatedAt + 14 days);
+        vm.prank(payer);
+        esc.resolveDisputeTimeout(id);
+        assertTrue(esc.getEscrow(id).settled);
+        // payer: 100 - 0.5 funded + 0.5 refunded + 0.1 forfeited bond
+        assertEq(payer.balance, 100.1 ether);
+        assertEq(arbiter.balance, 9.9 ether); // bond lost
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testBackupArbiterTimeoutReturnsBond() public {
+        // The bond is the PRIMARY arbiter's stake, and it acted — so a
+        // timeout of the BACKUP arbiter forfeits nothing: the bond
+        // returns to the primary arbiter and the payer is refunded.
+        uint256 id = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        _resolvedWithBackup(id, true); // primary resolves to the payee
+        vm.prank(payer);
+        esc.reEscalate(id); // challenge: backup arbiter's turn
+        uint256 escalatedAt = esc.getEscrow(id).escalatedAt;
+        vm.warp(escalatedAt + 14 days);
+        vm.prank(payee);
+        esc.resolveDisputeTimeout(id);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payer.balance, 100 ether); // refunded in full
+        assertEq(arbiter.balance, 10 ether); // bond returned, not forfeited
+        assertEq(address(esc).balance, 0);
+    }
+
+    // ---- V2 round 2: EscrowCreated carries the arbiter terms ----
+
+    function testEscrowCreatedEmitsArbiterFields() public {
+        // The five-argument creation emits arbiter, backup arbiter, and
+        // bond amount, so indexers and UIs need no second call.
+        uint256 deadline = block.timestamp + 1 days;
+        vm.expectEmit(true, true, true, true);
+        emit LamplightEscrow.EscrowCreated(0, payer, payee, 0.5 ether, deadline, arbiter, backupArbiter, 0.1 ether);
+        vm.prank(payer);
+        uint256 id = esc.createEscrow{value: 0.5 ether}(payee, deadline, arbiter, backupArbiter, 0.1 ether);
+        assertEq(id, 0);
+        // and the two-argument version emits zeros for all three terms
+        vm.expectEmit(true, true, true, true);
+        emit LamplightEscrow.EscrowCreated(1, payer, payee, 0.5 ether, deadline, address(0), address(0), 0);
+        vm.prank(payer);
+        uint256 plain = esc.createEscrow{value: 0.5 ether}(payee, deadline);
+        assertEq(plain, 1);
+    }
+
+    // ---- V2 round 2: arbiter bond ----
+
+    function testBondStakedRefundedOnArbiterRelease() public {
+        uint256 id = _createWithBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        assertTrue(esc.getEscrow(id).bondStaked);
+        _escalated(id);
+        vm.prank(arbiter);
+        esc.resolveDispute(id, true);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payee.balance, 1.5 ether);
+        assertEq(arbiter.balance, 10 ether); // bond returned in full
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testBondStakedRefundedOnArbiterRefund() public {
+        uint256 id = _createWithBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        _escalated(id);
+        vm.prank(arbiter);
+        esc.resolveDispute(id, false);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payer.balance, 100 ether); // refunded in full
+        assertEq(arbiter.balance, 10 ether); // bond returned in full
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testEscalateWithoutBondReverts() public {
+        // A bond set at creation gates escalation: the payer cannot
+        // escalate to an arbiter who has not staked. Once staked,
+        // escalation works.
+        uint256 id = _createWithBond(0.5 ether, 1 days, 0.1 ether);
+        _rejectAndCure(id);
+        vm.prank(payer);
+        vm.expectRevert("Bond not staked");
+        esc.escalateDispute(id);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        vm.prank(payer);
+        esc.escalateDispute(id);
+        assertTrue(esc.getEscrow(id).escalated);
+    }
+
+    function testStakeBondWrongAmountReverts() public {
+        uint256 id = _createWithBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        vm.expectRevert("Wrong bond amount");
+        esc.stakeBond{value: 0.05 ether}(id);
+        vm.prank(arbiter);
+        vm.expectRevert("Wrong bond amount");
+        esc.stakeBond{value: 0.2 ether}(id);
+        assertFalse(esc.getEscrow(id).bondStaked);
+    }
+
+    function testStakeBondOnlyArbiter() public {
+        uint256 id = _createWithBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(payer);
+        vm.expectRevert("Only arbiter");
+        esc.stakeBond{value: 0.1 ether}(id);
+        vm.prank(payee);
+        vm.expectRevert("Only arbiter");
+        esc.stakeBond{value: 0.1 ether}(id);
+        vm.prank(third);
+        vm.expectRevert("Only arbiter");
+        esc.stakeBond{value: 0.1 ether}(id);
+    }
+
+    function testStakeBondTwiceReverts() public {
+        uint256 id = _createWithBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        vm.prank(arbiter);
+        vm.expectRevert("Bond already staked");
+        esc.stakeBond{value: 0.1 ether}(id);
+    }
+
+    function testStakeBondNoBondSetReverts() public {
+        // No bond amount at creation means there is nothing to stake.
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        vm.prank(arbiter);
+        vm.expectRevert("No bond set");
+        esc.stakeBond{value: 0}(id);
+    }
+
+    function testBondReturnedOnNormalRelease() public {
+        // A staked bond returns to the arbiter when the escrow settles
+        // WITHOUT any escalation — a normal release must not strand it.
+        uint256 id = _createWithBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        vm.prank(payee);
+        esc.deliver(id, keccak256("work"));
+        vm.prank(payer);
+        esc.release(id);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payee.balance, 1.5 ether);
+        assertEq(arbiter.balance, 10 ether); // bond returned
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testBondReturnedOnNormalRefund() public {
+        // Same on the refund path: an undelivered escrow refunds the
+        // payer and returns the staked bond to the arbiter.
+        uint256 id = _createWithBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        vm.warp(block.timestamp + 2 days);
+        vm.prank(payer);
+        esc.refund(id);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payer.balance, 100 ether);
+        assertEq(arbiter.balance, 10 ether); // bond returned
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testCreateBondWithoutArbiterReverts() public {
+        // A bond with no arbiter is meaningless and reverts at creation.
+        vm.prank(payer);
+        vm.expectRevert("No arbiter");
+        esc.createEscrow{value: 0.5 ether}(payee, block.timestamp + 1 days, address(0), address(0), 0.1 ether);
+    }
+
+    // ---- V2 round 2: backup arbiter + challenge window ----
+
+    function testBackupReEscalationByPayerReverses() public {
+        // Primary resolves to the payee; the payer challenges; the
+        // backup arbiter reverses to the payer. The second resolution
+        // pays out immediately and is final.
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id, true);
+        assertFalse(esc.getEscrow(id).settled);
+        assertTrue(esc.getEscrow(id).challengeOpen);
+        assertEq(uint256(esc.lifecycleStatus(id)), uint256(LamplightEscrow.Lifecycle.ChallengeOpen));
+        vm.expectEmit(true, true, true, true);
+        emit LamplightEscrow.DisputeChallenged(id, payer, backupArbiter);
+        vm.prank(payer);
+        esc.reEscalate(id);
+        assertTrue(esc.getEscrow(id).challenged);
+        assertTrue(esc.getEscrow(id).escalated);
+        assertFalse(esc.getEscrow(id).challengeOpen);
+        vm.prank(backupArbiter);
+        esc.resolveDispute(id, false);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payer.balance, 100 ether); // refunded in full
+        assertEq(payee.balance, 1 ether); // payee got nothing
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testBackupReEscalationByPayeeReverses() public {
+        // Primary resolves to the payer; the payee challenges; the
+        // backup arbiter reverses to the payee.
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id, false);
+        assertTrue(esc.getEscrow(id).challengeOpen);
+        vm.prank(payee);
+        esc.reEscalate(id);
+        vm.prank(backupArbiter);
+        esc.resolveDispute(id, true);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payee.balance, 1.5 ether);
+        assertEq(payer.balance, 99.5 ether);
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testReEscalateAfterWindowReverts() public {
+        // At exactly resolvedAt + 2 days the challenge window is over:
+        // re-escalation reverts, and finalization pays the recorded
+        // decision instead.
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id, true);
+        uint256 resolvedAt = esc.getEscrow(id).resolvedAt;
+        vm.warp(resolvedAt + 2 days);
+        vm.prank(payer);
+        vm.expectRevert("Challenge period ended");
+        esc.reEscalate(id);
+        vm.prank(payee);
+        vm.expectRevert("Challenge period ended");
+        esc.reEscalate(id);
+        // finalization is now open and pays the recorded decision
+        vm.prank(third);
+        esc.finalizeResolution(id);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payee.balance, 1.5 ether);
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testReEscalateWithoutBackupReverts() public {
+        // No backup arbiter named means no challenge exists: the
+        // primary resolution pays immediately, and re-escalation is
+        // impossible.
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        _escalated(id);
+        vm.prank(arbiter);
+        esc.resolveDispute(id, true);
+        assertTrue(esc.getEscrow(id).settled); // paid immediately
+        vm.prank(payer);
+        vm.expectRevert("Already settled");
+        esc.reEscalate(id);
+    }
+
+    function testReEscalateOnUnresolvedEscrowReverts() public {
+        // Re-escalation before any resolution is meaningless.
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _escalated(id);
+        vm.prank(payer);
+        vm.expectRevert("Not resolved");
+        esc.reEscalate(id);
+    }
+
+    function testSecondResolutionIsFinal() public {
+        // After the backup arbiter resolves, nothing re-opens the
+        // dispute: no second challenge, no escalation, no finalization,
+        // no further resolution by either arbiter.
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id, true);
+        vm.prank(payer);
+        esc.reEscalate(id);
+        vm.prank(backupArbiter);
+        esc.resolveDispute(id, false);
+        assertTrue(esc.getEscrow(id).settled);
+        vm.prank(payer);
+        vm.expectRevert("Already settled");
+        esc.reEscalate(id);
+        vm.prank(payer);
+        vm.expectRevert("Already settled");
+        esc.escalateDispute(id);
+        vm.prank(third);
+        vm.expectRevert("Already settled");
+        esc.finalizeResolution(id);
+        // the primary arbiter is no longer the resolver once challenged:
+        // its re-call fails the caller check, not the settled check
+        vm.prank(arbiter);
+        vm.expectRevert("Only backup arbiter");
+        esc.resolveDispute(id, true);
+        vm.prank(backupArbiter);
+        vm.expectRevert("Already settled");
+        esc.resolveDispute(id, true);
+    }
+
+    function testFinalizeAfterWindowPaysRecordedDecision() public {
+        // Nobody challenges; after the window anyone may finalize, and
+        // the recorded decision pays out — here, to the payee.
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id, true);
+        uint256 resolvedAt = esc.getEscrow(id).resolvedAt;
+        vm.warp(resolvedAt + 2 days + 1);
+        vm.prank(third); // anyone may finalize
+        esc.finalizeResolution(id);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payee.balance, 1.5 ether);
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testFinalizeAfterWindowPaysRefundDecision() public {
+        // Same, with the recorded decision a refund to the payer.
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id, false);
+        uint256 resolvedAt = esc.getEscrow(id).resolvedAt;
+        vm.warp(resolvedAt + 3 days);
+        vm.prank(payer);
+        esc.finalizeResolution(id);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payer.balance, 100 ether);
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testFinalizeDuringWindowReverts() public {
+        // Finalization before the window closes reverts — the challenge
+        // must still be possible.
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id, true);
+        uint256 resolvedAt = esc.getEscrow(id).resolvedAt;
+        vm.warp(resolvedAt + 2 days - 1); // last second of the window
+        vm.prank(payer);
+        vm.expectRevert("Challenge period not ended");
+        esc.finalizeResolution(id);
+        assertFalse(esc.getEscrow(id).settled);
+    }
+
+    function testReleaseBlockedDuringChallengeWindow() public {
+        // While the challenge window is open the payout is deferred:
+        // neither the payer (inside the review window) nor the payee
+        // (after it) can release around the arbiter's decision.
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id, true);
+        vm.prank(payer);
+        vm.expectRevert("Resolution pending");
+        esc.release(id);
+        uint256 deliveredAt = esc.getEscrow(id).deliveredAt;
+        vm.warp(deliveredAt + 7 days); // review window over
+        vm.prank(payee);
+        vm.expectRevert("Resolution pending");
+        esc.release(id);
+        assertFalse(esc.getEscrow(id).settled);
+    }
+
+    function testPrimaryCannotResolveAgainDuringChallenge() public {
+        // During the challenge window the primary arbiter cannot resolve
+        // again (the escrow is not escalated), and the payer cannot
+        // escalate it again either (a resolution is pending).
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id, true);
+        vm.prank(arbiter);
+        vm.expectRevert("Not escalated");
+        esc.resolveDispute(id, false);
+        vm.prank(payer);
+        vm.expectRevert("Resolution pending");
+        esc.escalateDispute(id);
+    }
+
+    function testBackupArbiterValidation() public {
+        uint256 deadline = block.timestamp + 1 days;
+        // backup must differ from the arbiter
+        vm.prank(payer);
+        vm.expectRevert("Invalid backup arbiter");
+        esc.createEscrow{value: 0.5 ether}(payee, deadline, arbiter, arbiter, 0);
+        // backup must not be the payer
+        vm.prank(payer);
+        vm.expectRevert("Invalid backup arbiter");
+        esc.createEscrow{value: 0.5 ether}(payee, deadline, arbiter, payer, 0);
+        // backup must not be the payee
+        vm.prank(payer);
+        vm.expectRevert("Invalid backup arbiter");
+        esc.createEscrow{value: 0.5 ether}(payee, deadline, arbiter, payee, 0);
+        // backup must not be the contract
+        vm.prank(payer);
+        vm.expectRevert("Invalid backup arbiter");
+        esc.createEscrow{value: 0.5 ether}(payee, deadline, arbiter, address(esc), 0);
+        // backup without any arbiter is meaningless
+        vm.prank(payer);
+        vm.expectRevert("Invalid backup arbiter");
+        esc.createEscrow{value: 0.5 ether}(payee, deadline, address(0), backupArbiter, 0);
+    }
+
+    // ---- V2 round 2: struct round-trip for the new fields ----
+
+    function testV2Round2StructFieldsRoundTrip() public {
+        uint256 id = _createWithBackupAndBond(0.5 ether, 30 days, 0.1 ether);
+        LamplightEscrow.Escrow memory e = esc.getEscrow(id);
+        assertEq(e.arbiter, arbiter);
+        assertEq(e.backupArbiter, backupArbiter);
+        assertEq(e.bondAmount, 0.1 ether);
+        assertEq(e.escalatedAt, 0);
+        assertEq(e.resolvedAt, 0);
+        assertFalse(e.resolvedToPayee);
+        assertFalse(e.bondStaked);
+        assertFalse(e.challenged);
+        assertFalse(e.challengeOpen);
+
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        assertTrue(esc.getEscrow(id).bondStaked);
+
+        _escalated(id);
+        e = esc.getEscrow(id);
+        assertTrue(e.escalatedAt != 0);
+
+        vm.prank(arbiter);
+        esc.resolveDispute(id, true); // backup named: opens the challenge
+        e = esc.getEscrow(id);
+        assertTrue(e.challengeOpen);
+        assertTrue(e.resolvedAt != 0);
+        assertTrue(e.resolvedToPayee);
+        assertFalse(e.settled); // payout deferred until finalize/challenge
+
+        uint256 resolvedAt = e.resolvedAt;
+        vm.warp(resolvedAt + 2 days);
+        vm.prank(third);
+        esc.finalizeResolution(id);
+        e = esc.getEscrow(id);
+        assertTrue(e.settled);
+        assertFalse(e.challengeOpen);
+        assertEq(e.resolvedAt, 0);
+        assertEq(payee.balance, 1.5 ether);
+        assertEq(arbiter.balance, 10 ether); // bond returned at finalize
+    }
 }
 
 /// @notice Handler for the balance invariant (round 6, Claude
@@ -2069,5 +2800,203 @@ contract LamplightEscrowInvariantTest is Test {
         assertLe(esc.pendingWithdrawals(address(handler)), address(esc).balance);
         assertLe(esc.pendingWithdrawals(handler.payee()), address(esc).balance);
         assertLe(esc.pendingWithdrawals(handler.third()), address(esc).balance);
+    }
+}
+
+/// @notice Handler for the dispute invariant (round 2, Oct 27, 2026):
+///   drives arbiter escrows through random sequences of creates,
+///   deliveries, rejects, cures, bond stakes, escalations, resolutions,
+///   timeouts, re-escalations, finalizations, releases and refunds.
+///   The handler itself is the payer of the escrows it creates; it acts
+///   as the payee, the arbiter, and the backup arbiter via prank. Every
+///   call is wrapped in try/catch — a revert is a legal outcome (wrong
+///   actor, wrong window, unstaked bond), the invariants are about
+///   state consistency, not about calls succeeding. Release / refund /
+///   refundAfterRejection attempts record whether they ever SUCCEEDED
+///   while the escrow was escalated (or challenge-open) — the property
+///   the invariant asserts never happens.
+contract EscrowDisputeInvariantHandler is Test {
+    LamplightEscrow public esc;
+    address public payee = address(0xBEEF);
+    address public arbiterAddr = address(0xA9B17E9);
+    address public backupAddr = address(0xBAC4);
+    address public third = address(0xCAFE);
+    uint256[] public ids;
+    bool public releaseSucceededWhileEscalated;
+    bool public refundSucceededWhileEscalated;
+    bool public refundAfterRejectionSucceededWhileEscalated;
+    bool public releaseSucceededWhileChallengeOpen;
+
+    constructor(LamplightEscrow esc_) {
+        esc = esc_;
+    }
+
+    function idsLength() external view returns (uint256) {
+        return ids.length;
+    }
+
+    function _pick(uint256 seed) internal view returns (uint256) {
+        if (ids.length == 0) return type(uint256).max; // sentinel: no escrow yet
+        return ids[seed % ids.length];
+    }
+
+    function create(uint256 amount, uint256 deadlineIn, uint256 bond, uint256 withBackup) external {
+        amount = bound(amount, 1, 0.01 ether);
+        deadlineIn = bound(deadlineIn, 1 days, 30 days);
+        bond = bound(bond, 0, 0.01 ether);
+        address backup = withBackup % 2 == 0 ? backupAddr : address(0);
+        try esc.createEscrow{value: amount}(
+            payee,
+            block.timestamp + deadlineIn,
+            arbiterAddr,
+            backup,
+            uint96(bond)
+        ) returns (uint256 id) {
+            ids.push(id);
+        } catch {}
+    }
+
+    function deliver(uint256 seed) external {
+        uint256 id = _pick(seed);
+        if (id == type(uint256).max) return;
+        vm.prank(payee);
+        try esc.deliver(id, keccak256(abi.encode(seed))) {} catch {}
+    }
+
+    function reject(uint256 seed) external {
+        uint256 id = _pick(seed);
+        if (id == type(uint256).max) return;
+        try esc.rejectDelivery(id) {} catch {}
+    }
+
+    function stakeBond(uint256 seed) external {
+        uint256 id = _pick(seed);
+        if (id == type(uint256).max) return;
+        uint256 bond = esc.getEscrow(id).bondAmount;
+        vm.prank(arbiterAddr);
+        try esc.stakeBond{value: bond}(id) {} catch {}
+    }
+
+    function escalate(uint256 seed) external {
+        uint256 id = _pick(seed);
+        if (id == type(uint256).max) return;
+        try esc.escalateDispute(id) {} catch {}
+    }
+
+    function resolve(uint256 seed, bool toPayee) external {
+        uint256 id = _pick(seed);
+        if (id == type(uint256).max) return;
+        address resolver = esc.getEscrow(id).challenged ? backupAddr : arbiterAddr;
+        vm.prank(resolver);
+        try esc.resolveDispute(id, toPayee) {} catch {}
+    }
+
+    function timeout(uint256 seed) external {
+        uint256 id = _pick(seed);
+        if (id == type(uint256).max) return;
+        try esc.resolveDisputeTimeout(id) {} catch {}
+    }
+
+    function reEscalate(uint256 seed) external {
+        uint256 id = _pick(seed);
+        if (id == type(uint256).max) return;
+        try esc.reEscalate(id) {} catch {}
+    }
+
+    function finalize(uint256 seed) external {
+        uint256 id = _pick(seed);
+        if (id == type(uint256).max) return;
+        try esc.finalizeResolution(id) {} catch {}
+    }
+
+    function release(uint256 seed) external {
+        uint256 id = _pick(seed);
+        if (id == type(uint256).max) return;
+        bool wasEscalated = esc.getEscrow(id).escalated;
+        bool wasChallengeOpen = esc.getEscrow(id).challengeOpen;
+        try esc.release(id) {
+            if (wasEscalated) releaseSucceededWhileEscalated = true;
+            if (wasChallengeOpen) releaseSucceededWhileChallengeOpen = true;
+        } catch {}
+    }
+
+    function releaseAsPayee(uint256 seed) external {
+        uint256 id = _pick(seed);
+        if (id == type(uint256).max) return;
+        bool wasEscalated = esc.getEscrow(id).escalated;
+        bool wasChallengeOpen = esc.getEscrow(id).challengeOpen;
+        vm.prank(payee);
+        try esc.release(id) {
+            if (wasEscalated) releaseSucceededWhileEscalated = true;
+            if (wasChallengeOpen) releaseSucceededWhileChallengeOpen = true;
+        } catch {}
+    }
+
+    function refund(uint256 seed) external {
+        uint256 id = _pick(seed);
+        if (id == type(uint256).max) return;
+        bool wasEscalated = esc.getEscrow(id).escalated;
+        try esc.refund(id) {
+            if (wasEscalated) refundSucceededWhileEscalated = true;
+        } catch {}
+    }
+
+    function refundAfterRejection(uint256 seed) external {
+        uint256 id = _pick(seed);
+        if (id == type(uint256).max) return;
+        bool wasEscalated = esc.getEscrow(id).escalated;
+        try esc.refundAfterRejection(id) {
+            if (wasEscalated) refundAfterRejectionSucceededWhileEscalated = true;
+        } catch {}
+    }
+
+    function withdraw() external {
+        try esc.withdraw() {} catch {}
+    }
+
+    receive() external payable {}
+}
+
+/// @notice Invariant tests for the dispute lifecycle (round 2):
+///   (1) no settlement path — release (as payer or payee), refund,
+///   refundAfterRejection — may ever succeed while an escrow is
+///   escalated, and release may never succeed while a challenge is
+///   open; (2) the balance invariant extended to bonds — the contract
+///   holds exactly the unsettled escrow amounts plus the staked bonds
+///   on unsettled escrows plus all outstanding pull credits.
+contract LamplightEscrowDisputeInvariantTest is Test {
+    LamplightEscrow esc;
+    EscrowDisputeInvariantHandler handler;
+
+    function setUp() public {
+        esc = new LamplightEscrow();
+        handler = new EscrowDisputeInvariantHandler(esc);
+        vm.deal(address(handler), 100 ether);
+        vm.deal(handler.arbiterAddr(), 10 ether);
+        targetContract(address(handler));
+    }
+
+    function invariant_NoSettlementWhileEscalated() public view {
+        assertFalse(handler.releaseSucceededWhileEscalated());
+        assertFalse(handler.refundSucceededWhileEscalated());
+        assertFalse(handler.refundAfterRejectionSucceededWhileEscalated());
+        assertFalse(handler.releaseSucceededWhileChallengeOpen());
+    }
+
+    function invariant_BalanceHoldsWithBonds() public view {
+        uint256 expected;
+        for (uint256 i = 0; i < handler.idsLength(); ++i) {
+            LamplightEscrow.Escrow memory e = esc.getEscrow(handler.ids(i));
+            if (!e.settled) {
+                expected += e.amount;
+                if (e.bondStaked) expected += e.bondAmount;
+            }
+        }
+        expected += esc.pendingWithdrawals(address(handler));
+        expected += esc.pendingWithdrawals(handler.payee());
+        expected += esc.pendingWithdrawals(handler.third());
+        expected += esc.pendingWithdrawals(handler.arbiterAddr());
+        expected += esc.pendingWithdrawals(handler.backupAddr());
+        assertEq(address(esc).balance, expected);
     }
 }

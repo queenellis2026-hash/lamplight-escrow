@@ -35,10 +35,12 @@ front-end app around the contract, with a live preview beside the chat.
 Studio's security review replaced require-success payouts with
 pull payments (pendingWithdrawals + withdraw(), 100,000-gas cap on
 direct payouts) — that design was accepted Oct 27, and the local repo
-(`contracts/LamplightEscrow.sol`) now matches Studio's source exactly
-(same selectors, events, revert strings, crediting; reference copy at
-`studio-contract-reference.sol`). The repo carries 25 Foundry tests
-covering the same behaviour. Deploy target: Arc mainnet, with a 0.27
+(`contracts/LamplightEscrow.sol`) matched Studio's source exactly at
+v1 (same selectors, events, revert strings, crediting; reference copy
+at `studio-contract-reference.sol`). The repo is now v2 — optional
+per-escrow arbiter + round-2 hardening — with 130 Foundry tests;
+Studio must be updated to match v2 before the mainnet deploy (see
+STATUS.md). Deploy target: Arc mainnet, with a 0.27
 USDC escrow + 0.10 USDC split as the demo transaction.
 
 ## Submission fields (DoraHacks form)
@@ -68,13 +70,17 @@ USDC escrow + 0.10 USDC split as the demo transaction.
 - Arc Studio use: contracts, tests, and app built in Studio.
 - Working product: the hosted app (connect wallet, create/deliver/
   release/refund/split, plus a no-wallet simulated demo).
-- Potential: arbitrator/dispute role, scheduled payouts, payroll — same
-  escrow, more shapes.
+- Potential: scheduled payouts, payroll — same escrow, more shapes.
+  (The arbitrator/dispute role is now built: v2's optional
+  per-escrow arbiter.)
 
 ## Honest limits (stated in the app and here)
 
-- v1 has no arbitrator. If payer and payee disagree after delivery, the
-  payer still holds the release.
+- v2 has an optional per-escrow arbiter. If payer and payee disagree
+  after a cured delivery, the payer may escalate to the arbiter, who
+  decides; a silent arbiter costs at most 14 days (timeout
+  force-refunds the payer). Without an arbiter, the 7-day review
+  window still decides.
 - Pull payments: a credited recipient must call `withdraw()` to collect;
   a recipient whose receive function always reverts can never pull its
   credit (the funds stay accounted for in the contract, never lost, never
