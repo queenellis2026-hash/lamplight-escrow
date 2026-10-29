@@ -39,8 +39,12 @@ direct payouts) — that design was accepted Oct 27, and the local repo
 v1 (same selectors, events, revert strings, crediting; reference copy
 at `studio-contract-reference.sol`). The repo is now v2 — optional
 per-escrow arbiter + round-9 hardening — with 167 Foundry tests;
-Studio must be updated to match v2 round 9 before the mainnet deploy
-(see STATUS.md). Deploy target: Arc mainnet, with a 0.27
+Studio re-verified to v2 round 9 on Oct 28, 2026
+(see STATUS.md): contract replaced in full with the round-9 source
+(byte-identical), 157 Studio Foundry tests passing, fresh Arc
+testnet deployment 0xb6a3dacec470d04fc48a93a163f8f0d01330575c
+(tx 0x1579ac1697694be1fa90f5a4c9402971ef5acd6d73cf0e464b3ffed3a2d17bae),
+front-end updated to the new address, ABI, and lifecycle logic. Deploy target: Arc mainnet, with a 0.27
 USDC escrow + 0.10 USDC split as the demo transaction.
 
 ## Submission fields (DoraHacks form)

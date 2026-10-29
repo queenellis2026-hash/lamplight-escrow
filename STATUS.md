@@ -658,7 +658,10 @@ All items. 167/167 forge tests pass (158 + 9 new). V1 untouched
 - Push: rounds 3–9 on top of head `f1ce32ec` (round 2), app ABI
   regenerated from the round-9 build artifact (this commit).
 - Deploy: V2 is the deploy line and the deploy candidate (SOUND
-  commit). Studio must be updated to match it before the mainnet
-  deploy — browser re-verify, pending after this push. Sunday Nov 1
+  commit). Studio re-verified to v2 round 9 on Oct 28, 2026
+  (contract replaced in full, byte-identical; 157 Studio Foundry
+  tests passing; fresh Arc testnet deployment
+  0xb6a3dacec470d04fc48a93a163f8f0d01330575c, tx
+  0x1579ac1697694be1fa90f5a4c9402971ef5acd6d73cf0e464b3ffed3a2d17bae). Sunday Nov 1
   window: mainnet deploy + demo + video + DoraHacks submit before
   11:59 PM CDT.
