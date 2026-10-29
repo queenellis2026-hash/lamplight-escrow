@@ -38,9 +38,9 @@ direct payouts) — that design was accepted Oct 27, and the local repo
 (`contracts/LamplightEscrow.sol`) matched Studio's source exactly at
 v1 (same selectors, events, revert strings, crediting; reference copy
 at `studio-contract-reference.sol`). The repo is now v2 — optional
-per-escrow arbiter + round-2 hardening — with 130 Foundry tests;
-Studio must be updated to match v2 before the mainnet deploy (see
-STATUS.md). Deploy target: Arc mainnet, with a 0.27
+per-escrow arbiter + round-9 hardening — with 167 Foundry tests;
+Studio must be updated to match v2 round 9 before the mainnet deploy
+(see STATUS.md). Deploy target: Arc mainnet, with a 0.27
 USDC escrow + 0.10 USDC split as the demo transaction.
 
 ## Submission fields (DoraHacks form)
@@ -61,12 +61,13 @@ USDC escrow + 0.10 USDC split as the demo transaction.
 
 - Real USDC moving on Arc mainnet: 0.27 USDC escrow (create → deliver →
   release) + 0.10 USDC 50/50 split, both through the contract and the app.
-  Same flow already proven on a local fork of Arc mainnet — see
-  `fork-demo.log` (contract `0xaaab35fea863056be14985ee7bd35752eb942cf4`,
-  fork-only txs, clearly labelled as such and NOT mainnet evidence).
-  The fork demo also proves the pull path: a reverting split recipient
-  was credited exactly 0.05 USDC and pulled it with `withdraw()`,
-  leaving the contract at 0.
+  Same flows already proven on a local fork of Arc mainnet (Oct 28,
+  2026, `fork-demo.sh` — fork-only txs, NOT mainnet evidence): 0.27
+  escrow create → deliver → release; 0.10 split 50/50 with a
+  reverting recipient credited exactly 0.05 USDC and pulled with
+  `withdraw()`, leaving the contract at 0; and a 0.05
+  reject → cure → release flow (settled, rejectedOnce stays true).
+  Full demo gas 4,417,297 ≈ $0.110 at 25 gwei.
 - Arc Studio use: contracts, tests, and app built in Studio.
 - Working product: the hosted app (connect wallet, create/deliver/
   release/refund/split, plus a no-wallet simulated demo).
@@ -88,4 +89,6 @@ USDC escrow + 0.10 USDC split as the demo transaction.
 - Not audited. Experimental software, small amounts only.
 - The builder wallet starts at 0 USDC; the mainnet demo is funded with a
   small amount of real USDC (~$0.50 covers deploy + demo + buffer at the
-  observed 25 gwei gas price; full demo flow is ~1,497,123 gas ≈ $0.037).
+  observed 25 gwei gas price; full demo flow — deploy + 0.27 escrow
+  + 0.10 split + reject/cure/release — is 4,417,297 gas ≈ $0.110,
+  measured on a local fork of Arc mainnet, Oct 28, 2026).

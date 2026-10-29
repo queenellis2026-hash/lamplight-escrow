@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import "forge-std/Test.sol";
 import {Vm} from "forge-std/Vm.sol";
 import "../contracts/LamplightEscrow.sol";
+import "./LogScanners.sol";
 
 /// @notice A recipient whose receive() refuses payment while `reverting`
 ///   is set, and accepts it once cleared. Lets a test prove that a failed
@@ -163,7 +164,7 @@ contract ReentrantAttacker {
 
 /// @notice Full happy-path + failure tests for LamplightEscrow (pull design).
 /// Run: forge test
-contract LamplightEscrowTest is Test {
+contract LamplightEscrowTest is Test, LogScanners {
     LamplightEscrow esc;
     address payer = address(0xA11CE);
     address payee = address(0xBEEF);
@@ -2005,7 +2006,7 @@ contract LamplightEscrowTest is Test {
         esc.escalateDispute(id);
         assertEq(uint256(esc.lifecycleStatus(id)), uint256(LamplightEscrow.Lifecycle.Escalated));
         vm.expectEmit(true, true, false, true);
-        emit LamplightEscrow.DisputeResolved(id, arbiter, true);
+        emit LamplightEscrow.DisputeResolved(id, arbiter, true, 0, false); // no bond staked: 0 / false
         vm.prank(arbiter);
         esc.resolveDispute(id, true);
         assertTrue(esc.getEscrow(id).settled);
@@ -2178,13 +2179,15 @@ contract LamplightEscrowTest is Test {
 
     function testArbiterTimeoutRefundsPayerAtBoundary() public {
         // At exactly escalatedAt + 14 days the payer may force-refund.
+        // No bond was staked, so DisputeTimedOut carries the no-bond
+        // convention: bondAmount = 0, bondForfeited = false.
         uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
         _escalated(id);
         uint256 escalatedAt = esc.getEscrow(id).escalatedAt;
         vm.warp(escalatedAt + 14 days);
         uint256 before = payer.balance;
-        vm.expectEmit(true, true, false, false);
-        emit LamplightEscrow.DisputeTimedOut(id, payer);
+        vm.expectEmit(true, true, false, true);
+        emit LamplightEscrow.DisputeTimedOut(id, payer, 0, false);
         vm.prank(payer);
         esc.resolveDisputeTimeout(id);
         assertTrue(esc.getEscrow(id).settled);
@@ -2575,6 +2578,372 @@ contract LamplightEscrowTest is Test {
         assertFalse(esc.getEscrow(id).settled);
     }
 
+    // ---- Round 6: finalizeMatured — the keeper path ----
+
+    function testFinalizeMaturedBatchFinalizesMany() public {
+        // Three matured resolutions — two refunds, one release, one
+        // with a bond — finalize in a single call, by a third party.
+        uint256 id0 = _createWithBackup(0.5 ether, 1 days);
+        uint256 id1 = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
+        uint256 id2 = _createWithBackup(0.5 ether, 1 days);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id1);
+        _resolvedWithBackup(id0, true); // to the payee
+        _resolvedWithBackup(id1, false); // refund
+        _resolvedWithBackup(id2, false); // refund
+        uint256 resolvedAt = esc.getEscrow(id0).resolvedAt;
+        vm.warp(resolvedAt + 2 days + 1); // all three mature
+        uint256[] memory ids = new uint256[](3);
+        ids[0] = id0;
+        ids[1] = id1;
+        ids[2] = id2;
+        vm.expectEmit(true, false, false, true);
+        emit LamplightEscrow.MaturedResolutionsFinalized(third, 3);
+        vm.prank(third);
+        uint256 finalized = esc.finalizeMatured(ids);
+        assertEq(finalized, 3);
+        assertTrue(esc.getEscrow(id0).settled);
+        assertTrue(esc.getEscrow(id1).settled);
+        assertTrue(esc.getEscrow(id2).settled);
+        assertEq(payee.balance, 1.5 ether); // 1 from setUp + 0.5 released
+        assertEq(payer.balance, 99.5 ether); // 100 - 1.5 funded + 1.0 refunded
+        assertEq(arbiter.balance, 10 ether); // bond returned on finalization
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testFinalizeMaturedSkipsNonMatured() public {
+        // A blind sweep over a mixed list — one matured, one still
+        // inside its challenge window, one escalated but never
+        // resolved, one nonexistent, one already settled — finalizes
+        // only the matured one and never reverts.
+        uint256 id0 = _createWithBackup(0.5 ether, 1 days);
+        uint256 id1 = _createWithBackup(0.5 ether, 1 days);
+        uint256 id2 = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        uint256 id3 = _create(0.5 ether, 1 days);
+        _escalated(id0);
+        _escalated(id1);
+        _escalated(id2);
+        // id3: settle it plainly now, before any warp (its 1-day
+        // deadline would pass after the 3-day warp below).
+        vm.prank(payee);
+        esc.deliver(id3, keccak256("work"));
+        vm.prank(payer);
+        esc.release(id3);
+        assertTrue(esc.getEscrow(id3).settled);
+        vm.prank(arbiter);
+        esc.resolveDispute(id0, true); // resolved at T0; challenge opens
+        vm.warp(block.timestamp + 3 days); // id0 mature
+        vm.prank(arbiter);
+        esc.resolveDispute(id1, true); // resolved at T0+3d; window until T0+5d
+        // id2: escalated, never resolved.
+        uint256[] memory ids = new uint256[](5);
+        ids[0] = id0;
+        ids[1] = id1;
+        ids[2] = id2;
+        ids[3] = 99; // nonexistent
+        ids[4] = id3; // already settled
+        vm.prank(third);
+        uint256 finalized = esc.finalizeMatured(ids);
+        assertEq(finalized, 1);
+        assertTrue(esc.getEscrow(id0).settled);
+        assertFalse(esc.getEscrow(id1).settled);
+        assertTrue(esc.getEscrow(id1).challengeOpen);
+        assertFalse(esc.getEscrow(id2).settled);
+        assertEq(payee.balance, 2 ether); // 1 setUp + 0.5 id0 + 0.5 id3
+        // Contract still holds id1 + id2 (0.5 each).
+        assertEq(address(esc).balance, 1 ether);
+    }
+
+    function testFinalizeMaturedEmptyBatchReturnsZero() public {
+        uint256[] memory ids = new uint256[](0);
+        vm.prank(third);
+        uint256 finalized = esc.finalizeMatured(ids);
+        assertEq(finalized, 0);
+    }
+
+    function testFinalizeMaturedDuplicateIdFinalizesOnce() public {
+        // A duplicate id finalizes once: the second sighting finds it
+        // settled and skips it — no double payout.
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id, true);
+        uint256 resolvedAt = esc.getEscrow(id).resolvedAt;
+        vm.warp(resolvedAt + 2 days + 1);
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = id;
+        ids[1] = id;
+        vm.prank(third);
+        uint256 finalized = esc.finalizeMatured(ids);
+        assertEq(finalized, 1);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payee.balance, 1.5 ether); // paid exactly once
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testFinalizeMaturedNoBondFinalizesCleanly() public {
+        // A matured resolution with no bond at all finalizes cleanly
+        // in a batch — no bond logic, no special case.
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id, false); // refund decision, no bond
+        uint256 resolvedAt = esc.getEscrow(id).resolvedAt;
+        vm.warp(resolvedAt + 2 days + 1);
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = id;
+        vm.prank(third);
+        uint256 finalized = esc.finalizeMatured(ids);
+        assertEq(finalized, 1);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payer.balance, 100 ether); // refunded in full
+        assertEq(address(esc).balance, 0);
+    }
+
+    // ---- Round 7: finalizeMatured batch cap (MAX_FINALIZE_BATCH = 256) ----
+
+    function testFinalizeMaturedBatchCapPassesAtBound() public {
+        // A 256-id batch is accepted: one matured resolution among
+        // 255 nonexistent ids finalizes, the rest are skipped.
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id, true);
+        uint256 resolvedAt = esc.getEscrow(id).resolvedAt;
+        vm.warp(resolvedAt + 2 days + 1);
+        uint256[] memory ids = new uint256[](256);
+        ids[0] = id;
+        for (uint256 i = 1; i < 256; ++i) {
+            ids[i] = 99; // nonexistent, skipped
+        }
+        vm.prank(third);
+        uint256 finalized = esc.finalizeMatured(ids);
+        assertEq(finalized, 1);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payee.balance, 1.5 ether); // 1 setUp + 0.5 released
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testFinalizeMaturedBatchCapRevertsAboveBound() public {
+        // A 257-id batch reverts before the loop starts — no
+        // finalization happens, nothing is half-swept.
+        uint256[] memory ids = new uint256[](257);
+        for (uint256 i = 0; i < 257; ++i) {
+            ids[i] = 99; // nonexistent; the cap, not the ids, reverts
+        }
+        vm.prank(third);
+        vm.expectRevert("Batch too large");
+        esc.finalizeMatured(ids);
+    }
+
+    // ---- Round 9: maturedIds + autoFinalizeAfter ----
+
+    function testMaturedIdsListsOnlyMatured() public {
+        // Three escrows with a backup arbiter: one resolved and
+        // matured, one resolved but still inside its challenge
+        // window, one escalated but never resolved. maturedIds
+        // returns only the matured one — including at the exact
+        // boundary second (finalize uses >=) — and paging works: a
+        // range that starts past it, or a limit of zero, returns
+        // nothing.
+        uint256 id0 = _createWithBackup(0.5 ether, 1 days);
+        uint256 id1 = _createWithBackup(0.5 ether, 1 days);
+        uint256 id2 = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id0, true); // resolved at T0
+        _escalated(id1); // delivered + cured + escalated, pre-warp
+        _escalated(id2); // escalated, never resolved
+        uint256 resolvedAt0 = esc.getEscrow(id0).resolvedAt;
+        vm.warp(resolvedAt0 + 2 days); // boundary second: mature (>=)
+        uint256[] memory atBoundary = esc.maturedIds(0, 10);
+        assertEq(atBoundary.length, 1);
+        assertEq(atBoundary[0], id0);
+        vm.warp(block.timestamp + 1 days); // T0+3d
+        vm.prank(arbiter);
+        esc.resolveDispute(id1, true); // resolved at T0+3d; window until T0+5d
+        uint256[] memory all = esc.maturedIds(0, 10);
+        assertEq(all.length, 1);
+        assertEq(all[0], id0);
+        // Paging: the matured id is inside [0, 1) but not [1, 3).
+        uint256[] memory first = esc.maturedIds(0, 1);
+        assertEq(first.length, 1);
+        assertEq(first[0], id0);
+        assertEq(esc.maturedIds(1, 10).length, 0);
+        // Empty range and past-the-end start return empty, never revert.
+        assertEq(esc.maturedIds(0, 0).length, 0);
+        assertEq(esc.maturedIds(99, 10).length, 0);
+    }
+
+    function testMaturedIdsMatchesFinalizeMatured() public {
+        // The view and the sweep agree by construction (_isMatured):
+        // every id maturedIds returns is finalized by
+        // finalizeMatured, and afterwards maturedIds is empty.
+        uint256 id0 = _createWithBackup(0.5 ether, 1 days);
+        uint256 id1 = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
+        uint256 id2 = _createWithBackup(0.5 ether, 1 days);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id1);
+        _resolvedWithBackup(id0, true);
+        _resolvedWithBackup(id1, false);
+        _resolvedWithBackup(id2, false);
+        uint256 resolvedAt = esc.getEscrow(id0).resolvedAt;
+        vm.warp(resolvedAt + 2 days + 1); // all three mature
+        uint256[] memory matured = esc.maturedIds(0, 10);
+        assertEq(matured.length, 3);
+        vm.prank(third);
+        uint256 finalized = esc.finalizeMatured(matured);
+        assertEq(finalized, 3);
+        assertEq(esc.maturedIds(0, 10).length, 0);
+        assertEq(payee.balance, 1.5 ether);
+        assertEq(payer.balance, 99.5 ether);
+        assertEq(arbiter.balance, 10 ether); // bond returned
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testAutoFinalizeAfterPaysRecordedDecision() public {
+        // A stranger (not the keeper, not a party) finalizes one
+        // matured resolution — same payout, same events, same bond
+        // return as the batch path. Warped to the exact boundary
+        // second: mature at resolvedAt + 2 days (>=).
+        uint256 id = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        _resolvedWithBackup(id, true);
+        uint256 resolvedAt = esc.getEscrow(id).resolvedAt;
+        vm.warp(resolvedAt + 2 days);
+        vm.expectEmit(true, true, true, true);
+        emit LamplightEscrow.Released(id, payee, 0.5 ether);
+        vm.expectEmit(true, true, true, true);
+        emit LamplightEscrow.BondSettled(id, arbiter, 0.1 ether, false);
+        vm.prank(third); // anyone may call it
+        esc.autoFinalizeAfter(id);
+        assertTrue(esc.getEscrow(id).settled);
+        assertFalse(esc.getEscrow(id).challengeOpen);
+        assertEq(payee.balance, 1.5 ether);
+        assertEq(arbiter.balance, 10 ether); // bond returned
+        assertEq(address(esc).balance, 0);
+    }
+
+    /// @dev Round 9: finalize one escrow via autoFinalizeAfter as a
+    ///   stranger, assert the BondSettled event in the same call
+    ///   returns the bond to the arbiter unforfeited, and report the
+    ///   payee / arbiter balances after.
+    function _autoFinalizeChecked(uint256 id) internal returns (uint256 payeeBal, uint256 arbiterBal) {
+        vm.recordLogs();
+        vm.prank(third);
+        esc.autoFinalizeAfter(id);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        (bool found, address recipient, uint256 amount, bool forfeited) = _findBondSettled(logs);
+        assertTrue(found);
+        assertEq(recipient, arbiter);
+        assertEq(amount, 0.1 ether);
+        assertFalse(forfeited);
+        return (payee.balance, arbiter.balance);
+    }
+
+    /// @dev Round 9: finalize one escrow via finalizeMatured as a
+    ///   stranger, assert the same BondSettled event, and report the
+    ///   finalized count plus the payee / arbiter balances after.
+    function _batchFinalizeChecked(uint256 id)
+        internal
+        returns (uint256 finalized, uint256 payeeBal, uint256 arbiterBal)
+    {
+        uint256[] memory batch = new uint256[](1);
+        batch[0] = id;
+        vm.recordLogs();
+        vm.prank(third);
+        finalized = esc.finalizeMatured(batch);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        (bool found, address recipient, uint256 amount, bool forfeited) = _findBondSettled(logs);
+        assertTrue(found);
+        assertEq(recipient, arbiter);
+        assertEq(amount, 0.1 ether);
+        assertFalse(forfeited);
+        return (finalized, payee.balance, arbiter.balance);
+    }
+
+    function testAutoFinalizeAfterMatchesBatchPath() public {
+        // Two identical escrows — same amount, same bond, same
+        // resolution — one finalized by autoFinalizeAfter, one by
+        // finalizeMatured. Same end state: same balances, same
+        // per-escrow events (Released + BondSettled), same settled
+        // flags. The only difference is the batch summary event.
+        uint256 idA = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
+        uint256 idB = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(idA);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(idB);
+        _resolvedWithBackup(idA, true);
+        _resolvedWithBackup(idB, true);
+        uint256 resolvedAt = esc.getEscrow(idA).resolvedAt;
+        vm.warp(resolvedAt + 2 days + 1);
+        (uint256 payeeAfterAuto, uint256 arbiterAfterAuto) = _autoFinalizeChecked(idA);
+        (uint256 finalized, uint256 payeeAfterBatch, uint256 arbiterAfterBatch) =
+            _batchFinalizeChecked(idB);
+        assertEq(finalized, 1);
+        assertEq(payeeAfterBatch, payeeAfterAuto + 0.5 ether);
+        assertEq(arbiterAfterBatch, arbiterAfterAuto + 0.1 ether);
+        assertTrue(esc.getEscrow(idA).settled);
+        assertTrue(esc.getEscrow(idB).settled);
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testAutoFinalizeAfterDuringWindowReverts() public {
+        // While the challenge window is still open, the escape hatch
+        // stays shut — the challenge must still be possible.
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id, true);
+        uint256 resolvedAt = esc.getEscrow(id).resolvedAt;
+        vm.warp(resolvedAt + 2 days - 1); // last second of the window
+        vm.prank(third);
+        vm.expectRevert("Challenge period not ended");
+        esc.autoFinalizeAfter(id);
+        assertFalse(esc.getEscrow(id).settled);
+    }
+
+    function testAutoFinalizeAfterDoubleFinalizeReverts() public {
+        // A second call finds the escrow settled and reverts — no
+        // double payout. The old entry point agrees: it is settled too.
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id, true);
+        uint256 resolvedAt = esc.getEscrow(id).resolvedAt;
+        vm.warp(resolvedAt + 2 days + 1);
+        vm.prank(third);
+        esc.autoFinalizeAfter(id);
+        assertTrue(esc.getEscrow(id).settled);
+        vm.prank(third);
+        vm.expectRevert("Already settled");
+        esc.autoFinalizeAfter(id);
+        vm.prank(third);
+        vm.expectRevert("Already settled");
+        esc.finalizeResolution(id);
+        assertEq(payee.balance, 1.5 ether); // paid exactly once
+    }
+
+    function testAutoFinalizeAfterRefundDecision() public {
+        // Same escape hatch, recorded decision a refund: the payer
+        // is refunded in full and the bond returns to the arbiter.
+        uint256 id = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        _resolvedWithBackup(id, false);
+        uint256 resolvedAt = esc.getEscrow(id).resolvedAt;
+        vm.warp(resolvedAt + 3 days);
+        vm.prank(third);
+        esc.autoFinalizeAfter(id);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payer.balance, 100 ether);
+        assertEq(arbiter.balance, 10 ether); // bond returned
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testAutoFinalizeAfterOnUnresolvedReverts() public {
+        // No resolution, no challenge window: nothing to finalize.
+        // Nonexistent ids revert the same way finalizeResolution does.
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _escalated(id); // escalated, never resolved
+        vm.prank(third);
+        vm.expectRevert("Not resolved");
+        esc.autoFinalizeAfter(id);
+        vm.prank(third);
+        vm.expectRevert("Escrow not found");
+        esc.autoFinalizeAfter(99);
+    }
+
     function testReleaseBlockedDuringChallengeWindow() public {
         // While the challenge window is open the payout is deferred:
         // neither the payer (inside the review window) nor the payee
@@ -2671,6 +3040,436 @@ contract LamplightEscrowTest is Test {
         assertEq(e.resolvedAt, 0);
         assertEq(payee.balance, 1.5 ether);
         assertEq(arbiter.balance, 10 ether); // bond returned at finalize
+    }
+
+    // ---- Round 3: disputeClocks view, BondSettled event, forfeit-split invariant ----
+    // Round 5: the log scanners (_findBondSettled / _findDisputeTimedOut)
+    // moved to the shared LogScanners utility this contract inherits,
+    // so the two test contracts stay in sync by construction.
+
+    function testDisputeClocksNonEscalatedIsZero() public {
+        // Both clocks are 0 when no dispute is running: created,
+        // delivered, settled — and for an id that does not exist.
+        uint256 id = _create(0.5 ether, 1 days);
+        (uint256 timeoutRemaining, uint256 challengeRemaining) = esc.disputeClocks(id);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 0);
+        vm.prank(payee);
+        esc.deliver(id, keccak256("work"));
+        (timeoutRemaining, challengeRemaining) = esc.disputeClocks(id);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 0);
+        vm.prank(payer);
+        esc.release(id);
+        (timeoutRemaining, challengeRemaining) = esc.disputeClocks(id);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 0);
+        (timeoutRemaining, challengeRemaining) = esc.disputeClocks(999);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 0);
+    }
+
+    function testDisputeClocksEscalatedCountsDown() public {
+        // The timeout clock starts at exactly 14 days at escalation,
+        // counts down second for second, and reads 0 at the exact
+        // boundary second (the timeout call uses >=, so the clock is
+        // done there) — while the challenge clock stays 0 throughout.
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        _escalated(id);
+        uint256 escalatedAt = esc.getEscrow(id).escalatedAt;
+        (uint256 timeoutRemaining, uint256 challengeRemaining) = esc.disputeClocks(id);
+        assertEq(timeoutRemaining, 14 days);
+        assertEq(challengeRemaining, 0);
+        vm.warp(escalatedAt + 3 days);
+        (timeoutRemaining, challengeRemaining) = esc.disputeClocks(id);
+        assertEq(timeoutRemaining, 11 days);
+        assertEq(challengeRemaining, 0);
+        vm.warp(escalatedAt + 14 days);
+        (timeoutRemaining, challengeRemaining) = esc.disputeClocks(id);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 0);
+    }
+
+    function testDisputeClocksChallengeCountsDown() public {
+        // The challenge clock starts at exactly 2 days when the primary
+        // arbiter resolves, counts down, and reads 0 at the exact
+        // boundary second (finalize uses >=) — while the timeout clock
+        // stays 0, since the escrow is no longer escalated.
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id, true);
+        uint256 resolvedAt = esc.getEscrow(id).resolvedAt;
+        (uint256 timeoutRemaining, uint256 challengeRemaining) = esc.disputeClocks(id);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 2 days);
+        vm.warp(resolvedAt + 1 days);
+        (timeoutRemaining, challengeRemaining) = esc.disputeClocks(id);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 1 days);
+        vm.warp(resolvedAt + 2 days);
+        (timeoutRemaining, challengeRemaining) = esc.disputeClocks(id);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 0);
+    }
+
+    function testDisputeClocksRestartOnReEscalation() public {
+        // Re-escalation restarts the timeout clock from now (14 days
+        // again) and closes the challenge window (0).
+        uint256 id = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id, true);
+        vm.prank(payer);
+        esc.reEscalate(id);
+        (uint256 timeoutRemaining, uint256 challengeRemaining) = esc.disputeClocks(id);
+        assertEq(timeoutRemaining, 14 days);
+        assertEq(challengeRemaining, 0);
+    }
+
+    function testDisputeStatusNoBondIsZero() public {
+        // No bond set: amount 0, staked false, both clocks 0 — on a
+        // fresh escrow, a delivered one, a settled one, and an id
+        // that does not exist.
+        uint256 id = _create(0.5 ether, 1 days);
+        (uint256 bondAmount, bool bondStaked, uint256 timeoutRemaining, uint256 challengeRemaining) =
+            esc.disputeStatus(id);
+        assertEq(bondAmount, 0);
+        assertFalse(bondStaked);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 0);
+        vm.prank(payee);
+        esc.deliver(id, keccak256("work"));
+        (bondAmount, bondStaked, timeoutRemaining, challengeRemaining) = esc.disputeStatus(id);
+        assertEq(bondAmount, 0);
+        assertFalse(bondStaked);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 0);
+        vm.prank(payer);
+        esc.release(id);
+        (bondAmount, bondStaked, timeoutRemaining, challengeRemaining) = esc.disputeStatus(id);
+        assertEq(bondAmount, 0);
+        assertFalse(bondStaked);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 0);
+        (bondAmount, bondStaked, timeoutRemaining, challengeRemaining) = esc.disputeStatus(999);
+        assertEq(bondAmount, 0);
+        assertFalse(bondStaked);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 0);
+    }
+
+    function testDisputeStatusBondSetUnstakedThenStaked() public {
+        // A set bond reads (amount, false) before the stake and
+        // (amount, true) after it; the clocks stay 0 throughout
+        // (no dispute is running).
+        uint256 id = _createWithBond(0.5 ether, 1 days, 0.1 ether);
+        (uint256 bondAmount, bool bondStaked, uint256 timeoutRemaining, uint256 challengeRemaining) =
+            esc.disputeStatus(id);
+        assertEq(bondAmount, 0.1 ether);
+        assertFalse(bondStaked);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 0);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        (bondAmount, bondStaked, timeoutRemaining, challengeRemaining) = esc.disputeStatus(id);
+        assertEq(bondAmount, 0.1 ether);
+        assertTrue(bondStaked);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 0);
+    }
+
+    function testDisputeStatusEscalatedAndChallengeClocks() public {
+        // The timeout clock in disputeStatus is exactly
+        // disputeClocks': 14 days while escalated, challenge 0 —
+        // and the bond stays staked (held) while the dispute runs.
+        // (The challenge-open side is covered by
+        // testDisputeStatusChallengeOpenAndSettled.)
+        uint256 id = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        _escalated(id);
+        (uint256 bondAmount, bool bondStaked, uint256 timeoutRemaining, uint256 challengeRemaining) =
+            esc.disputeStatus(id);
+        assertEq(bondAmount, 0.1 ether);
+        assertTrue(bondStaked);
+        assertEq(timeoutRemaining, 14 days);
+        assertEq(challengeRemaining, 0);
+    }
+
+    function testDisputeStatusChallengeOpenAndSettled() public {
+        // Challenge open: challenge clock 2 days, timeout 0, bond
+        // still held; at the boundary the challenge clock reads 0;
+        // after finalization the bond is returned (staked false)
+        // and both clocks are 0.
+        uint256 id = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        _resolvedWithBackup(id, true);
+        uint256 resolvedAt = esc.getEscrow(id).resolvedAt;
+        (uint256 bondAmount, bool bondStaked, uint256 timeoutRemaining, uint256 challengeRemaining) =
+            esc.disputeStatus(id);
+        assertEq(bondAmount, 0.1 ether);
+        assertTrue(bondStaked);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 2 days);
+        vm.warp(resolvedAt + 2 days);
+        (bondAmount, bondStaked, timeoutRemaining, challengeRemaining) = esc.disputeStatus(id);
+        assertEq(bondAmount, 0.1 ether);
+        assertTrue(bondStaked);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 0);
+        esc.finalizeResolution(id);
+        (bondAmount, bondStaked, timeoutRemaining, challengeRemaining) = esc.disputeStatus(id);
+        assertEq(bondAmount, 0.1 ether);
+        assertFalse(bondStaked);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 0);
+    }
+
+    function testDisputeStatusTimeoutForfeitClearsBond() public {
+        // A primary-arbiter timeout forfeits the bond to the payer:
+        // after it the bond reads (amount, false) and both clocks
+        // are 0 — the view never reports a forfeited bond as held.
+        uint256 id = _createWithBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        _escalated(id);
+        uint256 escalatedAt = esc.getEscrow(id).escalatedAt;
+        vm.warp(escalatedAt + 14 days);
+        vm.prank(payer);
+        esc.resolveDisputeTimeout(id);
+        (uint256 bondAmount, bool bondStaked, uint256 timeoutRemaining, uint256 challengeRemaining) =
+            esc.disputeStatus(id);
+        assertEq(bondAmount, 0.1 ether);
+        assertFalse(bondStaked);
+        assertEq(timeoutRemaining, 0);
+        assertEq(challengeRemaining, 0);
+    }
+
+    function testBondSettledEventReturned() public {
+        // A bond returned on a normal release emits the single
+        // BondSettled event with the arbiter as recipient and
+        // forfeited = false.
+        uint256 id = _createWithBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        vm.prank(payee);
+        esc.deliver(id, keccak256("work"));
+        vm.recordLogs();
+        vm.prank(payer);
+        esc.release(id);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        (bool found, address recipient, uint256 amount, bool forfeited) = _findBondSettled(logs);
+        assertTrue(found);
+        assertEq(recipient, arbiter);
+        assertEq(amount, 0.1 ether);
+        assertFalse(forfeited);
+        assertEq(arbiter.balance, 10 ether); // bond returned in full
+    }
+
+    function testBondSettledEventForfeited() public {
+        // A bond forfeited on a primary-arbiter timeout emits the
+        // single BondSettled event with the payer as recipient and
+        // forfeited = true.
+        uint256 id = _createWithBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        _escalated(id);
+        uint256 escalatedAt = esc.getEscrow(id).escalatedAt;
+        vm.warp(escalatedAt + 14 days);
+        vm.recordLogs();
+        vm.prank(payer);
+        esc.resolveDisputeTimeout(id);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        (bool found, address recipient, uint256 amount, bool forfeited) = _findBondSettled(logs);
+        assertTrue(found);
+        assertEq(recipient, payer);
+        assertEq(amount, 0.1 ether);
+        assertTrue(forfeited);
+        assertEq(payer.balance, 100.1 ether); // refund + forfeited bond
+        assertEq(arbiter.balance, 9.9 ether); // bond lost
+    }
+
+    function testBackupTimeoutNeverForfeitsPrimaryBond() public {
+        // The forfeit-split rule, driven end to end: the primary
+        // arbiter resolved in time, the backup timed out, so the bond
+        // must come back to the primary — proved by the balances AND
+        // by the BondSettled event (recipient = arbiter, forfeited =
+        // false), never by a forfeit to the payer.
+        uint256 id = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        _resolvedWithBackup(id, true); // primary resolves to the payee
+        vm.prank(payer);
+        esc.reEscalate(id); // challenge: backup arbiter's turn
+        uint256 escalatedAt = esc.getEscrow(id).escalatedAt;
+        vm.warp(escalatedAt + 14 days);
+        vm.recordLogs();
+        vm.prank(payee);
+        esc.resolveDisputeTimeout(id);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        (bool found, address recipient, uint256 amount, bool forfeited) = _findBondSettled(logs);
+        assertTrue(found);
+        assertEq(recipient, arbiter);
+        assertEq(amount, 0.1 ether);
+        assertFalse(forfeited);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payer.balance, 100 ether); // refunded in full, no bond windfall
+        assertEq(arbiter.balance, 10 ether); // bond returned, not forfeited
+        assertEq(address(esc).balance, 0);
+    }
+
+    // ---- Round 4: DisputeTimedOut carries the bond outcome ----
+
+    function testDisputeTimedOutCarriesForfeitedBond() public {
+        // A primary-arbiter timeout with a staked bond: DisputeTimedOut
+        // carries the same bond outcome _settleBond settles — amount =
+        // the bond, forfeited = true — so indexers read the settlement
+        // from this one log instead of joining on BondSettled.
+        uint256 id = _createWithBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        _escalated(id);
+        uint256 escalatedAt = esc.getEscrow(id).escalatedAt;
+        vm.warp(escalatedAt + 14 days);
+        vm.recordLogs();
+        vm.prank(payer);
+        esc.resolveDisputeTimeout(id);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        (bool found, address caller, uint256 bondAmount, bool bondForfeited) = _findDisputeTimedOut(logs);
+        assertTrue(found);
+        assertEq(caller, payer);
+        assertEq(bondAmount, 0.1 ether);
+        assertTrue(bondForfeited);
+        // And the BondSettled event in the same call agrees exactly.
+        (bool bFound, address recipient, uint256 bAmount, bool bForfeited) = _findBondSettled(logs);
+        assertTrue(bFound);
+        assertEq(recipient, payer);
+        assertEq(bAmount, bondAmount);
+        assertEq(bForfeited, bondForfeited);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payer.balance, 100.1 ether); // refund + forfeited bond
+        assertEq(arbiter.balance, 9.9 ether); // bond lost
+    }
+
+    function testDisputeTimedOutCarriesReturnedBond() public {
+        // A backup-arbiter timeout with a staked bond: DisputeTimedOut
+        // carries amount = the bond, forfeited = false — the bond
+        // returns to the primary arbiter, and this event says so on
+        // its own.
+        uint256 id = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        _resolvedWithBackup(id, true); // primary resolves to the payee
+        vm.prank(payer);
+        esc.reEscalate(id); // challenge: backup arbiter's turn
+        uint256 escalatedAt = esc.getEscrow(id).escalatedAt;
+        vm.warp(escalatedAt + 14 days);
+        vm.recordLogs();
+        vm.prank(payee);
+        esc.resolveDisputeTimeout(id);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        (bool found, address caller, uint256 bondAmount, bool bondForfeited) = _findDisputeTimedOut(logs);
+        assertTrue(found);
+        assertEq(caller, payee);
+        assertEq(bondAmount, 0.1 ether);
+        assertFalse(bondForfeited);
+        // And the BondSettled event in the same call agrees exactly.
+        (bool bFound, address recipient, uint256 bAmount, bool bForfeited) = _findBondSettled(logs);
+        assertTrue(bFound);
+        assertEq(recipient, arbiter);
+        assertEq(bAmount, bondAmount);
+        assertEq(bForfeited, bondForfeited);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payer.balance, 100 ether); // refunded in full, no bond windfall
+        assertEq(arbiter.balance, 10 ether); // bond returned, not forfeited
+        assertEq(address(esc).balance, 0);
+    }
+
+    // ---- Round 6: DisputeResolved carries the bond outcome ----
+
+    function testDisputeResolvedCarriesSettledBond() public {
+        // An immediate arbiter resolution with a staked bond:
+        // DisputeResolved carries the same bond outcome _settleBond
+        // settles — amount = the bond, forfeited = false — matching
+        // the round-4 treatment of DisputeTimedOut, so indexers read
+        // the settlement from this one log instead of joining on
+        // BondSettled.
+        uint256 id = _createWithBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        _escalated(id);
+        vm.recordLogs();
+        vm.prank(arbiter);
+        esc.resolveDispute(id, true);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        (bool found, address resolvedArbiter, bool toPayee, uint256 bondAmount, bool bondForfeited) =
+            _findDisputeResolved(logs);
+        assertTrue(found);
+        assertEq(resolvedArbiter, arbiter);
+        assertTrue(toPayee);
+        assertEq(bondAmount, 0.1 ether);
+        assertFalse(bondForfeited);
+        // And the BondSettled event in the same call agrees exactly.
+        (bool bFound, address recipient, uint256 bAmount, bool bForfeited) = _findBondSettled(logs);
+        assertTrue(bFound);
+        assertEq(recipient, arbiter);
+        assertEq(bAmount, bondAmount);
+        assertEq(bForfeited, bondForfeited);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payee.balance, 1.5 ether);
+        assertEq(arbiter.balance, 10 ether); // bond returned, not forfeited
+        assertEq(address(esc).balance, 0);
+    }
+
+    function testDisputeResolvedDeferredCarriesNoBondOutcome() public {
+        // A first resolution with a backup arbiter named only opens
+        // the challenge window — no bond is settled in this call, so
+        // DisputeResolved carries the 0 / false convention even though
+        // a bond IS staked. The bond stays staked until the challenge
+        // is answered or the window closes.
+        uint256 id = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        _escalated(id);
+        vm.recordLogs();
+        vm.prank(arbiter);
+        esc.resolveDispute(id, true);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        (bool found, address resolvedArbiter, bool toPayee, uint256 bondAmount, bool bondForfeited) =
+            _findDisputeResolved(logs);
+        assertTrue(found);
+        assertEq(resolvedArbiter, arbiter);
+        assertTrue(toPayee);
+        assertEq(bondAmount, 0);
+        assertFalse(bondForfeited);
+        // No BondSettled event fired in this call — nothing settled.
+        (bool bFound,,,) = _findBondSettled(logs);
+        assertFalse(bFound);
+        assertFalse(esc.getEscrow(id).settled);
+        assertTrue(esc.getEscrow(id).challengeOpen);
+        assertTrue(esc.getEscrow(id).bondStaked);
+    }
+
+    function testDisputeResolvedNoBondCarriesZero() public {
+        // An immediate resolution with no bond staked: DisputeResolved
+        // carries the 0 / false convention, and no BondSettled event
+        // fires at all.
+        uint256 id = _createWithArbiter(0.5 ether, 1 days, arbiter);
+        _escalated(id);
+        vm.recordLogs();
+        vm.prank(arbiter);
+        esc.resolveDispute(id, true);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        (bool found, address resolvedArbiter, bool toPayee, uint256 bondAmount, bool bondForfeited) =
+            _findDisputeResolved(logs);
+        assertTrue(found);
+        assertEq(resolvedArbiter, arbiter);
+        assertTrue(toPayee);
+        assertEq(bondAmount, 0);
+        assertFalse(bondForfeited);
+        (bool bFound,,,) = _findBondSettled(logs);
+        assertFalse(bFound);
+        assertTrue(esc.getEscrow(id).settled);
+        assertEq(payee.balance, 1.5 ether);
+        assertEq(address(esc).balance, 0);
     }
 }
 
@@ -2826,6 +3625,60 @@ contract EscrowDisputeInvariantHandler is Test {
     bool public refundSucceededWhileEscalated;
     bool public refundAfterRejectionSucceededWhileEscalated;
     bool public releaseSucceededWhileChallengeOpen;
+    /// @dev Round 3 (Oct 27, 2026): set if a backup-arbiter timeout
+    ///   ever failed to return the primary's bond — the forfeit-split
+    ///   rule says the bond is the primary's stake and it acted, so
+    ///   only a PRIMARY timeout forfeits it to the payer.
+    bool public backupTimeoutForfeitedPrimaryBond;
+    /// @dev Round 3: how many challenged+staked timeouts succeeded —
+    ///   proves the fuzzer actually reaches the backup-timeout path
+    ///   (it needs a warp first; see warpTime below).
+    uint256 public backupTimeoutsSucceeded;
+    /// @dev Round 4 (Oct 27, 2026): set if a primary-arbiter timeout
+    ///   ever failed to forfeit the bond to the payer — the symmetric
+    ///   counterpart to backupTimeoutForfeitedPrimaryBond. The
+    ///   forfeit-split rule cuts both ways: a primary timeout MUST
+    ///   forfeit the bond, a backup timeout MUST return it.
+    bool public primaryTimeoutFailedToForfeitBond;
+    /// @dev Round 4: how many primary (unchallenged) + staked
+    ///   timeouts succeeded — proves the fuzzer actually reaches the
+    ///   primary-timeout path, the mirror of backupTimeoutsSucceeded.
+    uint256 public primaryTimeoutsSucceeded;
+    /// @dev Round 5 (Oct 27, 2026): the seed — one primary-timeout
+    ///   path driven before the random actions begin, so the
+    ///   forfeit-split invariant cannot pass vacuously. `seededId`
+    ///   is the seeded escrow (ids[0]); `seededPrimaryTimeoutReached`
+    ///   is set when its timeout succeeds. The seed exists because
+    ///   the fuzzer never reached a staked primary timeout on its own
+    ///   in 256 runs x 3840 calls (the chain is ~7 actions on one
+    ///   escrow with a warp in the middle).
+    bool public seeded;
+    uint256 public seededId;
+    bool public seededPrimaryTimeoutReached;
+    /// @dev Round 6 (Oct 28, 2026): the mirror seed — one
+    ///   backup-timeout path driven before the random actions begin,
+    ///   so BOTH sides of the forfeit-split rule are exercised from
+    ///   the very first invariant check. `seededBackupId` is the
+    ///   seeded escrow (ids[1]); `seededBackupTimeoutReached` is set
+    ///   when its backup timeout succeeds. The seed exists because
+    ///   the backup-timeout path is a ~9-action chain with two warps
+    ///   (challenge window, then timeout) that the fuzzer reaches
+    ///   only via the unit test today.
+    bool public seededBackup;
+    uint256 public seededBackupId;
+    bool public seededBackupTimeoutReached;
+    /// @dev Round 9 (Oct 28, 2026): the third seed — one
+    ///   challenge-open-then-finalize path driven before the random
+    ///   actions begin, so the balance-with-bonds invariant is
+    ///   exercised on the deferred-payout branch from the very first
+    ///   check. `seededFinalizeId` is the seeded escrow (ids[2]);
+    ///   `seededFinalizeReached` is set when its finalization
+    ///   succeeds. The seed exists because the deferred-payout
+    ///   branch needs a ~8-action chain with a warp that the fuzzer
+    ///   reaches only via the unit test today.
+    bool public seededFinalize;
+    uint256 public seededFinalizeId;
+    bool public seededFinalizeReached;
 
     constructor(LamplightEscrow esc_) {
         esc = esc_;
@@ -2833,6 +3686,105 @@ contract EscrowDisputeInvariantHandler is Test {
 
     function idsLength() external view returns (uint256) {
         return ids.length;
+    }
+
+    /// @dev Round 5: seed one primary-timeout path — create (arbiter +
+    ///   backup + bond), deliver, reject, cure (re-deliver), stake,
+    ///   escalate, warp past the 14-day timeout, timeout — using the
+    ///   handler's OWN actions, so the seeded escrow is real handler
+    ///   state (ids[0]), not a separate fixture. Called once from the
+    ///   invariant test's setUp, before the random actions begin, so
+    ///   the very first invariant check already covers a staked
+    ///   primary timeout. Idempotent: later calls — including from
+    ///   the fuzzer, which targets every external function here —
+    ///   are no-ops. The seeded escrow is settled by the seed, so
+    ///   later random actions on it exercise the settled-state
+    ///   revert paths; live-dispute interaction happens on
+    ///   fuzzer-created escrows.
+    function seedPrimaryTimeout() external {
+        if (seeded) return;
+        seeded = true;
+        this.create(0.01 ether, 1 days, 0.001 ether, 0); // even withBackup: backup set
+        seededId = ids[0];
+        this.deliver(0);
+        this.reject(0);
+        this.deliver(0); // cure
+        this.stakeBond(0);
+        this.escalate(0);
+        this.warpTime(15 days);
+        this.timeout(0); // primary arbiter times out; bond forfeits to the payer
+    }
+
+    /// @dev Round 6: seed one backup-timeout path — create (arbiter +
+    ///   backup + bond), deliver, reject, cure (re-deliver), stake,
+    ///   escalate, primary resolves (challenge opens), re-escalate to
+    ///   the backup, warp past the 14-day timeout, timeout — using the
+    ///   handler's OWN actions, so the seeded escrow is real handler
+    ///   state (ids[1]), not a separate fixture. Called once from the
+    ///   invariant test's setUp, right after seedPrimaryTimeout, before
+    ///   the random actions begin, so the very first invariant check
+    ///   already covers a staked backup timeout. Idempotent: later
+    ///   calls — including from the fuzzer, which targets every
+    ///   external function here — are no-ops. The seeded escrow is
+    ///   settled by the seed, so later random actions on it exercise
+    ///   the settled-state revert paths; live-dispute interaction
+    ///   happens on fuzzer-created escrows. Net effect on balances:
+    ///   the timeout refunds the escrow amount and returns the bond,
+    ///   so the seed is balance-neutral for both parties — after both
+    ///   seeds the handler is still 100.001 ether and the arbiter
+    ///   still 9.999 ether (the primary seed's forfeit is the only
+    ///   net movement). The round-9 finalize seed then pays the
+    ///   payee 0.01 ether, so after all three seeds the handler is
+    ///   99.991 ether.
+    function seedBackupTimeout() external {
+        if (seededBackup) return;
+        seededBackup = true;
+        this.create(0.01 ether, 1 days, 0.001 ether, 0); // even withBackup: backup set
+        seededBackupId = ids[1];
+        this.deliver(1);
+        this.reject(1);
+        this.deliver(1); // cure
+        this.stakeBond(1);
+        this.escalate(1);
+        this.resolve(1, true); // primary resolves: challenge opens
+        this.reEscalate(1); // challenge: backup arbiter's turn
+        this.warpTime(15 days);
+        this.timeout(1); // backup arbiter times out; bond returns to the primary
+    }
+
+    /// @dev Round 9: seed one challenge-open-then-finalize path —
+    ///   create (arbiter + backup + bond), deliver, reject, cure
+    ///   (re-deliver), stake, escalate, primary resolves (challenge
+    ///   opens), warp past the 2-day challenge window, finalize —
+    ///   using the handler's OWN actions, so the seeded escrow is
+    ///   real handler state (ids[2]), not a separate fixture. Called
+    ///   once from the invariant test's setUp, right after
+    ///   seedBackupTimeout, before the random actions begin, so the
+    ///   very first invariant check already covers a finalized
+    ///   deferred payout with its bond returned. Idempotent: later
+    ///   calls — including from the fuzzer, which targets every
+    ///   external function here — are no-ops. The seeded escrow is
+    ///   settled by the seed, so later random actions on it exercise
+    ///   the settled-state revert paths; live-dispute interaction
+    ///   happens on fuzzer-created escrows. Net effect on balances:
+    ///   the finalization pays the payee 0.01 ether and returns the
+    ///   bond, so the handler (payer) is 0.01 ether down after all
+    ///   three seeds — 99.991 ether — while the arbiter is untouched
+    ///   by this seed and stays 9.999 ether (only the primary seed's
+    ///   forfeit moved it).
+    function seedChallengeOpenFinalize() external {
+        if (seededFinalize) return;
+        seededFinalize = true;
+        this.create(0.01 ether, 1 days, 0.001 ether, 0); // even withBackup: backup set
+        seededFinalizeId = ids[2];
+        this.deliver(2);
+        this.reject(2);
+        this.deliver(2); // cure
+        this.stakeBond(2);
+        this.escalate(2);
+        this.resolve(2, true); // primary resolves: challenge opens
+        this.warpTime(3 days); // past the 2-day challenge window
+        this.finalize(2); // deferred payout: payee paid, bond returned
     }
 
     function _pick(uint256 seed) internal view returns (uint256) {
@@ -2894,7 +3846,66 @@ contract EscrowDisputeInvariantHandler is Test {
     function timeout(uint256 seed) external {
         uint256 id = _pick(seed);
         if (id == type(uint256).max) return;
-        try esc.resolveDisputeTimeout(id) {} catch {}
+        // Snapshot the bond state before the call: if this is a
+        // re-escalated (challenged) escrow with a staked bond, the
+        // timeout must return the bond to the PRIMARY arbiter — it
+        // acted, the stall is the backup's fault. Track it as a
+        // direct payment OR a pull credit, so a credited return
+        // still counts as returned.
+        LamplightEscrow.Escrow memory before = esc.getEscrow(id);
+        uint256 arbiterBalBefore = arbiterAddr.balance;
+        uint256 arbiterCreditBefore = esc.pendingWithdrawals(arbiterAddr);
+        // Round 4: the handler is the payer of every escrow it
+        // creates, so snapshot its balance too — a primary timeout
+        // must forfeit the bond TO the payer, on top of refunding
+        // the escrow amount.
+        uint256 payerBalBefore = address(this).balance;
+        uint256 payerCreditBefore = esc.pendingWithdrawals(address(this));
+        try esc.resolveDisputeTimeout(id) {
+            if (before.challenged && before.bondStaked) {
+                uint256 arbiterReceived = (arbiterAddr.balance - arbiterBalBefore) +
+                    (esc.pendingWithdrawals(arbiterAddr) - arbiterCreditBefore);
+                if (arbiterReceived != before.bondAmount) {
+                    backupTimeoutForfeitedPrimaryBond = true;
+                }
+                ++backupTimeoutsSucceeded;
+            } else if (!before.challenged && before.bondStaked) {
+                // Round 4: a PRIMARY timeout forfeits the bond to the
+                // payer. The timeout also refunds the escrow amount
+                // to the payer, so the payer must receive amount +
+                // bond in total — direct payment or pull credit.
+                uint256 payerReceived = (address(this).balance - payerBalBefore) +
+                    (esc.pendingWithdrawals(address(this)) - payerCreditBefore);
+                if (payerReceived != uint256(before.amount) + before.bondAmount) {
+                    primaryTimeoutFailedToForfeitBond = true;
+                }
+                ++primaryTimeoutsSucceeded;
+            }
+            // Round 5: the seeded path was reached — a timeout on the
+            // seeded escrow (ids[0]) succeeded. The seed test asserts
+            // this flag, and the mutation proof relies on it: with the
+            // forfeit broken, the seed's own timeout sets the flag
+            // above and the invariant fails on the first check.
+            if (seeded && id == seededId) seededPrimaryTimeoutReached = true;
+            // Round 6: the same for the backup seed — a timeout on the
+            // seeded backup escrow (ids[1]) succeeded. The backup seed
+            // test asserts this flag, and the backup mutation proof
+            // relies on it: with the backup return broken, the seed's
+            // own timeout sets backupTimeoutForfeitedPrimaryBond
+            // above and the invariant fails on the first check.
+            if (seededBackup && id == seededBackupId) seededBackupTimeoutReached = true;
+        } catch {}
+    }
+
+    /// @dev Round 3: advance time so the timeout and challenge clocks
+    ///   are reachable — without a warp, resolveDisputeTimeout can
+    ///   never succeed in a fuzz run (escalatedAt is always "now") and
+    ///   the forfeit-split invariant would be vacuous. Bounded to 30
+    ///   days forward; the other invariants are time-independent, so
+    ///   warping cannot break them.
+    function warpTime(uint256 days_) external {
+        days_ = bound(days_, 0, 30 days);
+        vm.warp(block.timestamp + days_);
     }
 
     function reEscalate(uint256 seed) external {
@@ -2906,7 +3917,12 @@ contract EscrowDisputeInvariantHandler is Test {
     function finalize(uint256 seed) external {
         uint256 id = _pick(seed);
         if (id == type(uint256).max) return;
-        try esc.finalizeResolution(id) {} catch {}
+        try esc.finalizeResolution(id) {
+            // Round 9: the seeded path was reached — a finalization
+            // on the seeded escrow (ids[2]) succeeded. The seed test
+            // asserts this flag.
+            if (seededFinalize && id == seededFinalizeId) seededFinalizeReached = true;
+        } catch {}
     }
 
     function release(uint256 seed) external {
@@ -2963,8 +3979,12 @@ contract EscrowDisputeInvariantHandler is Test {
 ///   escalated, and release may never succeed while a challenge is
 ///   open; (2) the balance invariant extended to bonds — the contract
 ///   holds exactly the unsettled escrow amounts plus the staked bonds
-///   on unsettled escrows plus all outstanding pull credits.
-contract LamplightEscrowDisputeInvariantTest is Test {
+///   on unsettled escrows plus all outstanding pull credits; (3) round
+///   3: a backup-arbiter timeout never forfeits the primary's bond —
+///   the forfeit-split rule is invariant-checked, not only unit-tested.
+///   (4) round 4: the symmetric side — a primary-arbiter timeout
+///   always forfeits the bond to the payer.
+contract LamplightEscrowDisputeInvariantTest is Test, LogScanners {
     LamplightEscrow esc;
     EscrowDisputeInvariantHandler handler;
 
@@ -2973,6 +3993,26 @@ contract LamplightEscrowDisputeInvariantTest is Test {
         handler = new EscrowDisputeInvariantHandler(esc);
         vm.deal(address(handler), 100 ether);
         vm.deal(handler.arbiterAddr(), 10 ether);
+        // Round 5: seed one primary-timeout path before the random
+        // actions begin, so the forfeit-split invariant is exercised
+        // from the very first check. The seed is ids[0]; the two
+        // reachability tests below therefore drive their OWN escrow
+        // (seed 3 since round 9) and their balance assertions account
+        // for the seeded escrow's forfeited bond.
+        handler.seedPrimaryTimeout();
+        // Round 6: seed one backup-timeout path as well, so both
+        // sides of the forfeit-split rule are exercised from the very
+        // first check. The seed is ids[1]; it is balance-neutral (the
+        // timeout refunds the amount and returns the bond), so the
+        // balance assertions below are unchanged from round 5.
+        handler.seedBackupTimeout();
+        // Round 9: seed one challenge-open-then-finalize path as
+        // well, so the deferred-payout branch is exercised from the
+        // very first check. The seed is ids[2]; it pays the payee
+        // 0.01 ether and returns the bond, so the handler is 99.991
+        // ether after all three seeds — the balance assertions below
+        // account for it.
+        handler.seedChallengeOpenFinalize();
         targetContract(address(handler));
     }
 
@@ -2981,6 +4021,21 @@ contract LamplightEscrowDisputeInvariantTest is Test {
         assertFalse(handler.refundSucceededWhileEscalated());
         assertFalse(handler.refundAfterRejectionSucceededWhileEscalated());
         assertFalse(handler.releaseSucceededWhileChallengeOpen());
+    }
+
+    /// @dev Round 3: the forfeit-split rule as an invariant — across
+    ///   every random sequence the handler drives, a backup-arbiter
+    ///   timeout must never leave the primary arbiter without its
+    ///   bond back.
+    function invariant_BackupTimeoutNeverForfeitsPrimaryBond() public view {
+        assertFalse(handler.backupTimeoutForfeitedPrimaryBond());
+    }
+
+    /// @dev Round 4: the forfeit-split rule, symmetric side — across
+    ///   every random sequence the handler drives, a primary-arbiter
+    ///   timeout must forfeit the bond to the payer.
+    function invariant_PrimaryTimeoutForfeitsBond() public view {
+        assertFalse(handler.primaryTimeoutFailedToForfeitBond());
     }
 
     function invariant_BalanceHoldsWithBonds() public view {
@@ -2998,5 +4053,178 @@ contract LamplightEscrowDisputeInvariantTest is Test {
         expected += esc.pendingWithdrawals(handler.arbiterAddr());
         expected += esc.pendingWithdrawals(handler.backupAddr());
         assertEq(address(esc).balance, expected);
+    }
+
+    /// @dev Round 3: drives the handler through its OWN actions to a
+    ///   backup-arbiter timeout — create (with backup + bond), deliver,
+    ///   reject, cure, stake, escalate, primary resolve, re-escalate,
+    ///   warp past the 14-day timeout, timeout — and asserts the
+    ///   handler recorded exactly one successful backup timeout and
+    ///   never flagged a forfeit. Without this, the fuzz invariant
+    ///   above could pass vacuously if the random sequences never
+    ///   reached a backup timeout. Round 5: the actions target seed 1
+    ///   (ids[1], this test's own escrow) because ids[0] is the
+    ///   seeded primary-timeout escrow from setUp; the arbiter's
+    ///   balance is 9.999 ether, not 10 — the seed's 0.001 bond was
+    ///   forfeited to the handler in setUp, and this test's bond was
+    ///   staked then returned. Round 6: the actions target seed 2
+    ///   (ids[2]) because ids[1] is now the seeded backup-timeout
+    ///   escrow, and the timeout count is asserted as a delta (seed
+    ///   1 + this test 1) — the balance assertions are unchanged,
+    ///   because the backup seed is balance-neutral. Round 9: the
+    ///   actions target seed 3 (ids[3]) because ids[2] is now the
+    ///   seeded challenge-open-finalize escrow; the arbiter balance
+    ///   is unchanged, because the finalize seed returns its bond.
+    function testDisputeHandlerReachesBackupTimeout() public {
+        uint256 backupBefore = handler.backupTimeoutsSucceeded(); // 1, from the seed
+        handler.create(0.01 ether, 1 days, 0.001 ether, 0); // even withBackup: backup set
+        handler.deliver(3);
+        handler.reject(3);
+        handler.deliver(3); // cure
+        handler.stakeBond(3);
+        handler.escalate(3);
+        handler.resolve(3, true); // primary resolves: challenge opens
+        handler.reEscalate(3);
+        handler.warpTime(15 days);
+        handler.timeout(3); // backup arbiter times out
+        assertEq(handler.backupTimeoutsSucceeded(), backupBefore + 1);
+        assertFalse(handler.backupTimeoutForfeitedPrimaryBond());
+        assertTrue(esc.getEscrow(3).settled);
+        assertEq(handler.arbiterAddr().balance, 9.999 ether); // bond returned
+    }
+
+    // Round 5: _findBondSettled moved to the shared LogScanners
+    // utility this contract inherits (it was duplicated here in
+    // round 4 because the helper was internal to the main test
+    // contract). The scanner is identical; only its home changed.
+
+    /// @dev Round 4: the mirror of testDisputeHandlerReachesBackupTimeout —
+    ///   drives the handler through its OWN actions to a PRIMARY-arbiter
+    ///   timeout — create (no backup + bond), deliver, reject, cure,
+    ///   stake, escalate, warp past the 14-day timeout, timeout — and
+    ///   asserts the handler recorded exactly one successful primary
+    ///   timeout, never flagged a missed forfeit, and the BondSettled
+    ///   event says the bond went to the payer (the handler) with
+    ///   forfeited = true. Without this, the fuzz invariant above
+    ///   could pass vacuously if the random sequences never reached a
+    ///   primary timeout. Round 5: the actions target seed 1 (ids[1],
+    ///   this test's own escrow) because ids[0] is the seeded
+    ///   primary-timeout escrow from setUp — so the timeout count is
+    ///   asserted as a delta (seed 1 + this test 1), and the balances
+    ///   account for the seed: the handler is 99.992 ether (100
+    ///   dealt + 0.001 seed bond forfeited in setUp - 0.01 finalize
+    ///   seed payout - 0.01 this escrow + 0.01 refund + 0.001 this
+    ///   bond forfeited), the arbiter is 9.998 ether (10 - 0.001 seed
+    ///   bond forfeited - 0.001 this bond forfeited). Round 6: the
+    ///   actions target seed 2 (ids[2]) because ids[1] is now the
+    ///   seeded backup-timeout escrow; the count delta and the
+    ///   balances are unchanged, because the backup seed is
+    ///   balance-neutral. Round 9: the actions target seed 3 (ids[3])
+    ///   because ids[2] is now the seeded challenge-open-finalize
+    ///   escrow; the handler balance drops by the finalize seed's
+    ///   0.01 payout, the arbiter balance is unchanged.
+    function testDisputeHandlerReachesPrimaryTimeout() public {
+        uint256 primaryBefore = handler.primaryTimeoutsSucceeded(); // 1, from the seed
+        handler.create(0.01 ether, 1 days, 0.001 ether, 1); // odd withBackup: no backup
+        handler.deliver(3);
+        handler.reject(3);
+        handler.deliver(3); // cure
+        handler.stakeBond(3);
+        handler.escalate(3);
+        handler.warpTime(15 days);
+        vm.recordLogs();
+        handler.timeout(3); // primary arbiter times out
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(handler.primaryTimeoutsSucceeded(), primaryBefore + 1);
+        assertFalse(handler.primaryTimeoutFailedToForfeitBond());
+        assertTrue(esc.getEscrow(3).settled);
+        // The handler is the payer: it funded 0.01, and the timeout
+        // refunds it AND forfeits the arbiter's 0.001 bond to it —
+        // so it ends 0.001 ahead of the 100 ether it was dealt, plus
+        // the 0.001 the seed forfeited to it in setUp, minus the 0.01
+        // the finalize seed paid out.
+        assertEq(address(handler).balance, 99.992 ether);
+        assertEq(handler.arbiterAddr().balance, 9.998 ether); // both bonds lost
+        (bool found, address recipient, uint256 amount, bool forfeited) = _findBondSettled(logs);
+        assertTrue(found);
+        assertEq(recipient, address(handler));
+        assertEq(amount, 0.001 ether);
+        assertTrue(forfeited);
+    }
+
+    /// @dev Round 5: pins the seed itself — setUp already drove the
+    ///   seeded escrow (ids[0]) through create + stake + escalate +
+    ///   warp + timeout, so by the time any test runs, the handler
+    ///   recorded exactly one successful primary timeout, never
+    ///   flagged a missed forfeit, the seeded escrow is settled, and
+    ///   the seeded-timeout flag is set. If the seed ever stops
+    ///   running (or the timeout stops succeeding), this fails — the
+    ///   fuzz invariant can no longer silently pass vacuously. The
+    ///   handler is 99.991 ether (100 dealt - 0.01 seeded escrow +
+    ///   0.01 refund + 0.001 bond forfeited - 0.01 finalize-seed
+    ///   payout); the arbiter is 9.999 ether (10 - 0.001 bond
+    ///   forfeited). Round 9: the finalize seed pays the payee, so
+    ///   the handler balance drops by 0.01 from the round-5 figure.
+    function testSeededPrimaryTimeoutIsReached() public {
+        assertTrue(handler.seeded());
+        assertEq(handler.seededId(), 0);
+        assertTrue(handler.seededPrimaryTimeoutReached());
+        assertEq(handler.primaryTimeoutsSucceeded(), 1);
+        assertFalse(handler.primaryTimeoutFailedToForfeitBond());
+        assertTrue(esc.getEscrow(0).settled);
+        assertEq(address(handler).balance, 99.991 ether);
+        assertEq(handler.arbiterAddr().balance, 9.999 ether);
+    }
+
+    /// @dev Round 6: pins the backup seed itself — setUp already drove
+    ///   the seeded escrow (ids[1]) through create + stake + escalate
+    ///   + primary resolve + re-escalate + warp + timeout, so by the
+    ///   time any test runs, the handler recorded exactly one
+    ///   successful backup timeout, never flagged a forfeit, the
+    ///   seeded escrow is settled, and the seeded-timeout flag is
+    ///   set. If the seed ever stops running (or the timeout stops
+    ///   succeeding), this fails — the fuzz invariant can no longer
+    ///   silently pass vacuously. The seed is balance-neutral (the
+    ///   timeout refunds the amount and returns the bond), so the
+    ///   balances are the same as the primary-seed test: the handler
+    ///   is 99.991 ether and the arbiter 9.999 ether, both moved
+    ///   only by the primary seed's forfeit and the finalize seed's
+    ///   payout. Round 9: the handler figure drops by the finalize
+    ///   seed's 0.01 payout from the round-6 figure.
+    function testSeededBackupTimeoutIsReached() public {
+        assertTrue(handler.seededBackup());
+        assertEq(handler.seededBackupId(), 1);
+        assertTrue(handler.seededBackupTimeoutReached());
+        assertEq(handler.backupTimeoutsSucceeded(), 1);
+        assertFalse(handler.backupTimeoutForfeitedPrimaryBond());
+        assertTrue(esc.getEscrow(1).settled);
+        assertEq(address(handler).balance, 99.991 ether);
+        assertEq(handler.arbiterAddr().balance, 9.999 ether);
+    }
+
+    /// @dev Round 9: pins the finalize seed itself — setUp already
+    ///   drove the seeded escrow (ids[2]) through create + stake +
+    ///   escalate + primary resolve + warp + finalize, so by the
+    ///   time any test runs, the handler recorded a successful
+    ///   finalization on it, the seeded escrow is settled with its
+    ///   challenge window closed, and the seeded-finalize flag is
+    ///   set. If the seed ever stops running (or the finalization
+    ///   stops succeeding), this fails — the fuzz invariant can no
+    ///   longer silently pass vacuously on the deferred-payout
+    ///   branch. The seed pays the payee 0.01 ether and returns the
+    ///   bond, so the handler is 99.991 ether (100 dealt + 0.001
+    ///   primary-seed forfeit - 0.01 this payout) and the arbiter is
+    ///   9.999 ether (10 - 0.001 primary-seed forfeit; this seed's
+    ///   bond was staked then returned).
+    function testSeededChallengeOpenFinalizeIsReached() public {
+        assertTrue(handler.seededFinalize());
+        assertEq(handler.seededFinalizeId(), 2);
+        assertTrue(handler.seededFinalizeReached());
+        assertTrue(esc.getEscrow(2).settled);
+        assertFalse(esc.getEscrow(2).challengeOpen);
+        assertEq(uint256(esc.lifecycleStatus(2)), uint256(LamplightEscrow.Lifecycle.Settled));
+        assertEq(handler.payee().balance, 0.01 ether);
+        assertEq(address(handler).balance, 99.991 ether);
+        assertEq(handler.arbiterAddr().balance, 9.999 ether);
     }
 }

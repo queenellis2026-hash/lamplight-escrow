@@ -51,6 +51,47 @@ pragma solidity ^0.8.24;
 ///      resolution stands and anyone may finalize it. The payout is
 ///      deferred while the challenge window is open, so a reversed
 ///      decision never has to claw funds back.
+///      Round 3 (Oct 27, 2026) adds three Grok improvements on top:
+///      (1) a disputeClocks view returning the remaining arbiter-timeout
+///      and challenge-window seconds, so UIs never re-derive the two
+///      clocks; (2) a single BondSettled event (with a forfeited bool)
+///      replacing BondReturned / BondForfeited, so indexers watch one
+///      event; (3) an invariant that a backup-arbiter timeout never
+///      forfeits the primary's bond, so the forfeit-split rule is
+///      invariant-checked, not only unit-tested.
+///      Round 4 (Oct 27, 2026) adds three more Grok improvements:
+///      (1) a NatSpec cross-reference on disputeClocks pointing at the
+///      constants and functions that define the two clock boundaries;
+///      (2) the symmetric invariant — a primary-arbiter timeout DOES
+///      forfeit the bond, checked in the handler alongside the round-3
+///      backup check; (3) DisputeTimedOut now carries the bond outcome
+///      (bondAmount, bondForfeited) so indexers read the settlement
+///      from one log instead of joining on BondSettled.
+///      Round 5 (Oct 27, 2026) adds three more Grok improvements:
+///      (1) a NatSpec note on _settleBond's return — only
+///      resolveDisputeTimeout uses the tuple, every other caller
+///      discards it; (2) the dispute handler's fuzz setup seeds one
+///      primary-timeout path (create + stake + escalate + warp +
+///      timeout) before the random actions, so the forfeit-split
+///      invariant is exercised from the very first check instead of
+///      only by the unit test; (3) the duplicated log-scanner
+///      helpers (_findBondSettled / _findDisputeTimedOut) move to a
+///      shared test utility so both test contracts stay in sync.
+///      Round 6 (Oct 28, 2026) adds three Grok improvements plus the
+///      auto-finalize keeper path (a Grok round-2 feature, held until
+///      now): (1) a second seeded fuzz path for the backup-timeout
+///      side of the forfeit-split rule, so both sides are exercised
+///      from the very first invariant check; (2) DisputeResolved now
+///      carries the bond outcome (bondAmount, bondForfeited),
+///      matching the round-4 treatment of DisputeTimedOut, so every
+///      settlement log is self-contained; (3) the three createEscrow
+///      overloads collapse into a single internal path that skips
+///      the arbiter-term validation and the zero arbiter-term writes
+///      when no arbiter terms are set, trimming gas on the common
+///      no-arbiter create; (4) finalizeMatured — a permissionless
+///      batch finalizer so a keeper can sweep matured resolutions in
+///      one call (see scripts/keeper.sh), and a resolution never
+///      sits unfinalized forever because both parties went offline.
 ///   2. Payment splitting — one incoming USDC payment split across up to 5
 ///      recipients in a single transaction, by basis points.
 /// @dev Storage is packed: the Escrow struct fits in 7 slots (was 8 in
@@ -209,6 +250,15 @@ contract LamplightEscrow {
     ///   escrow to react. Only applies when a backup arbiter was named.
     uint256 public constant CHALLENGE_PERIOD = 2 days;
 
+    /// @dev Max ids in one finalizeMatured batch (round 7, Oct 28,
+    ///   2026, Grok improvement): 256. The loop is no longer
+    ///   unbounded — a careless or malicious batch cannot run the call
+    ///   out of gas and revert the whole sweep. 256 is comfortably
+    ///   above the keeper's 100-id batches (see scripts/keeper.sh),
+    ///   so normal sweeps never touch the bound; a batch over the cap
+    ///   reverts "Batch too large" and the caller splits it.
+    uint256 public constant MAX_FINALIZE_BATCH = 256;
+
     event EscrowCreated(
         uint256 indexed id,
         address indexed payer,
@@ -222,12 +272,45 @@ contract LamplightEscrow {
     event Delivered(uint256 indexed id, bytes32 workHash);
     event DeliveryRejected(uint256 indexed id, address indexed payer, bytes32 rejectedWorkHash);
     event DisputeEscalated(uint256 indexed id, address indexed payer, address indexed arbiter);
-    event DisputeResolved(uint256 indexed id, address indexed arbiter, bool releasedToPayee);
-    event DisputeTimedOut(uint256 indexed id, address indexed caller);
+    /// @dev Bond outcome on a resolution (round 6, Oct 28, 2026, Grok
+    ///   improvement): bondAmount / bondForfeited are exactly the
+    ///   values _settleBond settles in the same call — matching the
+    ///   round-4 treatment of DisputeTimedOut — so every settlement
+    ///   log is self-contained. On the deferred path (a backup arbiter
+    ///   was named and the first resolution only opens the challenge
+    ///   window), no bond is settled in this call, so the convention
+    ///   is bondAmount = 0, bondForfeited = false; the bond settles
+    ///   later, when the resolution is finalized or the backup arbiter
+    ///   resolves or times out, and is reported in BondSettled then.
+    ///   When no bond was staked the convention is likewise 0 / false.
+    event DisputeResolved(
+        uint256 indexed id, address indexed arbiter, bool releasedToPayee, uint256 bondAmount, bool bondForfeited
+    );
+    /// @dev Bond outcome on a timeout (round 4, Oct 27, 2026, Grok
+    ///   improvement): bondAmount / bondForfeited are exactly the
+    ///   values _settleBond settles in the same call — bondAmount is
+    ///   the staked bond, bondForfeited is true only when the silent
+    ///   arbiter was the primary (the bond is forfeited to the payer)
+    ///   and false when the bond returns to the primary arbiter after
+    ///   a backup timeout. When no bond was staked the convention is
+    ///   bondAmount = 0, bondForfeited = false. Indexers read the
+    ///   settlement outcome from this one log instead of joining on
+    ///   BondSettled.
+    event DisputeTimedOut(uint256 indexed id, address indexed caller, uint256 bondAmount, bool bondForfeited);
     event DisputeChallenged(uint256 indexed id, address indexed challenger, address indexed backupArbiter);
+    /// @dev One summary event for a finalizeMatured batch (round 6,
+    ///   Oct 28, 2026): the keeper that swept the batch and how many
+    ///   resolutions it actually finalized. The per-escrow outcomes
+    ///   are in the Released / Refunded / BondSettled events each
+    ///   finalization emits; this event only says the sweep ran.
+    event MaturedResolutionsFinalized(address indexed caller, uint256 finalized);
     event BondStaked(uint256 indexed id, address indexed arbiter, uint256 amount);
-    event BondReturned(uint256 indexed id, address indexed arbiter, uint256 amount);
-    event BondForfeited(uint256 indexed id, address indexed payer, uint256 amount);
+    /// @dev One bond-settlement event (round 3, Oct 27, 2026, Grok
+    ///   improvement): the recipient is the arbiter when the bond is
+    ///   returned (forfeited = false) and the payer when it is forfeited
+    ///   (forfeited = true), so off-chain indexers need only watch one
+    ///   event instead of two.
+    event BondSettled(uint256 indexed id, address indexed recipient, uint256 amount, bool forfeited);
     event DeadlineExtended(uint256 indexed id, uint256 newDeadline);
     event Released(uint256 indexed id, address indexed payee, uint256 amount);
     event Refunded(uint256 indexed id, address indexed payer, uint256 amount);
@@ -242,6 +325,15 @@ contract LamplightEscrow {
         entered = false;
     }
 
+    /// @dev Round 8 (Oct 28, 2026, Grok improvement): the guard is
+    ///   applied uniformly to every state-changing external entry
+    ///   point — including deliver() and the three createEscrow
+    ///   overloads, which make no external calls today — so a future
+    ///   edit that adds one cannot silently open a reentrancy path.
+    ///   The cost is one SLOAD + two SSTOREs per guarded call (the
+    ///   second SSTORE refunds on the 0-write); see the round-8 gas
+    ///   record for the measured deltas.
+
     /// @notice Fund an escrow for a distinct, nonzero payee and a future deadline.
     /// @dev Amounts above 2**96 wei revert ("Amount too large"); deadlines
     ///   past 2**40 seconds revert as "Invalid deadline". Both bounds are
@@ -250,7 +342,7 @@ contract LamplightEscrow {
     /// @param payee Recipient entitled to deliver work and receive a released payment.
     /// @param deadline Earliest timestamp for a refund if work has not been delivered.
     /// @return id The newly created escrow identifier, starting at zero.
-    function createEscrow(address payee, uint256 deadline) external payable returns (uint256 id) {
+    function createEscrow(address payee, uint256 deadline) external payable nonReentrant returns (uint256 id) {
         return _createEscrow(payee, deadline, address(0), address(0), 0);
     }
 
@@ -268,6 +360,7 @@ contract LamplightEscrow {
     function createEscrow(address payee, uint256 deadline, address arbiter)
         external
         payable
+        nonReentrant
         returns (uint256 id)
     {
         return _createEscrow(payee, deadline, arbiter, address(0), 0);
@@ -296,7 +389,7 @@ contract LamplightEscrow {
         address arbiter,
         address backupArbiter,
         uint96 bondAmount
-    ) external payable returns (uint256 id) {
+    ) external payable nonReentrant returns (uint256 id) {
         return _createEscrow(payee, deadline, arbiter, backupArbiter, bondAmount);
     }
 
@@ -328,6 +421,21 @@ contract LamplightEscrow {
     }
 
     /// @dev Shared creation logic for all createEscrow overloads.
+    ///   The three external overloads are zero-default convenience
+    ///   signatures over this one internal path (round 6, Oct 28,
+    ///   2026, Grok improvement): the 2-arg version passes no arbiter
+    ///   terms, the 3-arg version passes an arbiter, the 5-arg version
+    ///   passes all three terms. When no arbiter terms are set at all,
+    ///   the arbiter-term validation and the arbiter-term writes are
+    ///   skipped: a fresh struct is already zero in every arbiter
+    ///   field, so writing a zero there is a no-op that still pays
+    ///   the cold-slot SSTORE cost — skipping it trims a few hundred
+    ///   gas on the common no-arbiter create. The skip is exactly
+    ///   semantics-preserving: validation can only revert when at
+    ///   least one term is nonzero (an invalid arbiter needs an
+    ///   arbiter, an invalid backup needs a backup, "No arbiter"
+    ///   needs a bond), so when all three are zero it trivially
+    ///   passes, and the writes it skips would have written zeros.
     function _createEscrow(
         address payee,
         uint256 deadline,
@@ -336,7 +444,10 @@ contract LamplightEscrow {
         uint96 bondAmount
     ) internal returns (uint256 id) {
         require(payee != address(0) && payee != msg.sender && payee != address(this), "Invalid payee");
-        _validateArbiterTerms(payee, arbiter, backupArbiter, bondAmount);
+        bool hasArbiterTerms = arbiter != address(0) || backupArbiter != address(0) || bondAmount != 0;
+        if (hasArbiterTerms) {
+            _validateArbiterTerms(payee, arbiter, backupArbiter, bondAmount);
+        }
         require(msg.value > 0, "Zero payment");
         require(msg.value <= type(uint96).max, "Amount too large");
         require(deadline > block.timestamp && deadline <= type(uint40).max, "Invalid deadline");
@@ -349,9 +460,11 @@ contract LamplightEscrow {
         e.payee = payee;
         e.amount = uint96(msg.value);
         e.deadline = uint40(deadline);
-        e.arbiter = arbiter;
-        e.backupArbiter = backupArbiter;
-        e.bondAmount = bondAmount;
+        if (hasArbiterTerms) {
+            e.arbiter = arbiter;
+            e.backupArbiter = backupArbiter;
+            e.bondAmount = bondAmount;
+        }
         nextEscrowId = id + 1;
         emit EscrowCreated(id, msg.sender, payee, msg.value, deadline, arbiter, backupArbiter, bondAmount);
     }
@@ -372,7 +485,7 @@ contract LamplightEscrow {
     ///   that refund with a junk hash and a fresh review window.
     /// @param id Existing escrow identifier.
     /// @param workHash Nonzero commitment to the delivered work.
-    function deliver(uint256 id, bytes32 workHash) external {
+    function deliver(uint256 id, bytes32 workHash) external nonReentrant {
         Escrow storage escrow = escrows[id];
         require(escrow.payer != address(0), "Escrow not found");
         require(msg.sender == escrow.payee, "Only payee");
@@ -542,11 +655,14 @@ contract LamplightEscrow {
             // decision and open the challenge window instead of paying.
             // The bond stays staked until the challenge is answered or
             // the window closes and the resolution is finalized.
+            // No bond is settled in this call (see the DisputeResolved
+            // NatSpec), so the bond fields carry the 0 / false
+            // convention.
             escrow.escalated = false;
             escrow.challengeOpen = true;
             escrow.resolvedAt = uint40(block.timestamp);
             escrow.resolvedToPayee = releaseToPayee;
-            emit DisputeResolved(id, msg.sender, releaseToPayee);
+            emit DisputeResolved(id, msg.sender, releaseToPayee, 0, false);
             return;
         }
 
@@ -561,8 +677,8 @@ contract LamplightEscrow {
             _payOrCredit(escrow.payer, escrow.amount);
             emit Refunded(id, escrow.payer, escrow.amount);
         }
-        _settleBond(escrow, id, false);
-        emit DisputeResolved(id, msg.sender, releaseToPayee);
+        (uint256 resolvedBondAmount, bool resolvedBondForfeited) = _settleBond(escrow, id, false);
+        emit DisputeResolved(id, msg.sender, releaseToPayee, resolvedBondAmount, resolvedBondForfeited);
     }
 
     /// @notice Force-refund an escrow whose arbiter has been silent too long.
@@ -576,6 +692,9 @@ contract LamplightEscrow {
     ///   bond returns to the primary arbiter instead: it resolved in
     ///   time, the stall is the backup's fault, and the backup staked
     ///   nothing. A failed payout credits the recipient for withdrawal.
+    ///   The DisputeTimedOut event carries the bond outcome from the
+    ///   same call (bondAmount, bondForfeited): 0 / false when no bond
+    ///   was staked.
     /// @param id Existing, escalated, unsettled escrow identifier.
     function resolveDisputeTimeout(uint256 id) external nonReentrant {
         Escrow storage escrow = escrows[id];
@@ -595,8 +714,8 @@ contract LamplightEscrow {
         escrow.resolvedAt = 0;
         _payOrCredit(escrow.payer, escrow.amount);
         emit Refunded(id, escrow.payer, escrow.amount);
-        _settleBond(escrow, id, forfeitBond);
-        emit DisputeTimedOut(id, msg.sender);
+        (uint256 timedOutBondAmount, bool timedOutBondForfeited) = _settleBond(escrow, id, forfeitBond);
+        emit DisputeTimedOut(id, msg.sender, timedOutBondAmount, timedOutBondForfeited);
     }
 
     /// @notice Re-escalate a resolved dispute to the backup arbiter.
@@ -628,16 +747,13 @@ contract LamplightEscrow {
         emit DisputeChallenged(id, msg.sender, escrow.backupArbiter);
     }
 
-    /// @notice Finalize an unchallenged arbiter resolution after the challenge window closes.
-    /// @dev Anyone may call it — finalization pays the recorded decision
-    ///   to the recorded winner regardless of who triggers it, so there
-    ///   is nothing to grief. Only when a resolution is pending
-    ///   (challengeOpen) and the CHALLENGE_PERIOD has passed. The staked
-    ///   bond, if any, returns to the arbiter. If a backup arbiter was
-    ///   never named, resolveDispute pays out immediately and this
-    ///   function is never needed.
-    /// @param id Existing, resolved, unsettled escrow identifier.
-    function finalizeResolution(uint256 id) external nonReentrant {
+    /// @dev Shared finalization guards for finalizeResolution and
+    ///   autoFinalizeAfter (round 9, Oct 28, 2026): the escrow exists,
+    ///   is unsettled, has a challenge window open, and the
+    ///   CHALLENGE_PERIOD has passed. Reverts, never skips —
+    ///   finalizeMatured's skip rule stays separate, because a batch
+    ///   must not fail on one bad id.
+    function _requireMaturedResolution(uint256 id) internal view {
         Escrow storage escrow = escrows[id];
         require(escrow.payer != address(0), "Escrow not found");
         require(!escrow.settled, "Already settled");
@@ -646,7 +762,93 @@ contract LamplightEscrow {
             block.timestamp >= escrow.resolvedAt + CHALLENGE_PERIOD,
             "Challenge period not ended"
         );
+    }
 
+    /// @notice Finalize an unchallenged arbiter resolution after the challenge window closes.
+    /// @dev Anyone may call it — finalization pays the recorded decision
+    ///   to the recorded winner regardless of who triggers it, so there
+    ///   is nothing to grief. Only when a resolution is pending
+    ///   (challengeOpen) and the CHALLENGE_PERIOD has passed. The staked
+    ///   bond, if any, returns to the arbiter. If a backup arbiter was
+    ///   never named, resolveDispute pays out immediately and this
+    ///   function is never needed. autoFinalizeAfter is the same
+    ///   single-id finalization under the keeper/automation name.
+    ///   For sweeping many matured resolutions in one call, see
+    ///   finalizeMatured.
+    /// @param id Existing, resolved, unsettled escrow identifier.
+    function finalizeResolution(uint256 id) external nonReentrant {
+        _requireMaturedResolution(id);
+        _finalizeResolution(id);
+    }
+
+    /// @notice Finalize one matured resolution, callable by anyone — the
+    ///   single-id escape hatch when the keeper is offline (round 9,
+    ///   Oct 28, 2026, Grok feature).
+    /// @dev Exactly the same finalization as finalizeResolution — same
+    ///   guards (_requireMaturedResolution), same _finalizeResolution
+    ///   path, same events, same bond return — under a name keepers
+    ///   and automation can call without building a batch. It reverts
+    ///   while the challenge window is still open ("Challenge period
+    ///   not ended") and on a second call ("Already settled"), so a
+    ///   resolution can never finalize twice. For sweeping many
+    ///   matured resolutions in one call, see finalizeMatured; for
+    ///   the matured ids themselves, see maturedIds.
+    /// @param id Existing, resolved, unsettled escrow identifier.
+    function autoFinalizeAfter(uint256 id) external nonReentrant {
+        _requireMaturedResolution(id);
+        _finalizeResolution(id);
+    }
+
+    /// @notice Finalize every matured resolution in a list, in one call — the keeper path.
+    /// @dev Anyone may call it — finalization pays the recorded decision
+    ///   regardless of who triggers it, so there is nothing to grief.
+    ///   An id is finalized only when its resolution is matured: the
+    ///   escrow exists, is unsettled, has a challenge window open, and
+    ///   the CHALLENGE_PERIOD has passed. Every other id — nonexistent,
+    ///   already settled, never resolved, or still inside its challenge
+    ///   window — is SKIPPED, not reverted, so a keeper can sweep
+    ///   blindly over a range of ids and the whole batch never fails
+    ///   on one bad entry. A duplicate id finalizes once: the second
+    ///   sighting finds it settled and skips it. A failed payout
+    ///   credits the recipient for withdrawal (see _payOrCredit), so
+    ///   one broken payee cannot block the batch. The batch itself is
+    ///   capped at MAX_FINALIZE_BATCH (256) ids — a longer list
+    ///   reverts "Batch too large" before the loop starts, so a
+    ///   careless or malicious batch cannot run the call out of gas.
+    ///   Returns the number of resolutions actually finalized. The
+    ///   maturity rule lives in _isMatured, shared with maturedIds,
+    ///   so the view and the sweep can never disagree. See
+    ///   scripts/keeper.sh for the keeper that calls this.
+    /// @param ids Escrow identifiers to sweep.
+    /// @return finalized How many resolutions were finalized.
+    function finalizeMatured(uint256[] calldata ids) external nonReentrant returns (uint256 finalized) {
+        require(ids.length <= MAX_FINALIZE_BATCH, "Batch too large");
+        for (uint256 i = 0; i < ids.length; ++i) {
+            if (_isMatured(escrows[ids[i]])) {
+                _finalizeResolution(ids[i]);
+                ++finalized;
+            }
+        }
+        emit MaturedResolutionsFinalized(msg.sender, finalized);
+    }
+
+    /// @dev Shared maturity rule for finalizeMatured and maturedIds
+    ///   (round 9, Oct 28, 2026): the escrow exists, is unsettled,
+    ///   has a challenge window open, and the CHALLENGE_PERIOD has
+    ///   passed (finalizeResolution uses >=, so the boundary second
+    ///   counts). One definition, so the view and the sweep can never
+    ///   disagree about which ids are matured.
+    function _isMatured(Escrow storage escrow) internal view returns (bool) {
+        return escrow.payer != address(0) && !escrow.settled && escrow.challengeOpen
+            && block.timestamp >= escrow.resolvedAt + CHALLENGE_PERIOD;
+    }
+
+    /// @dev Shared finalization logic: pay the recorded decision and
+    ///   return the bond. Caller must have checked the escrow is a
+    ///   matured, unchallenged resolution (challengeOpen, window
+    ///   closed, unsettled).
+    function _finalizeResolution(uint256 id) internal {
+        Escrow storage escrow = escrows[id];
         bool releaseToPayee = escrow.resolvedToPayee;
         escrow.settled = true;
         escrow.challengeOpen = false;
@@ -861,6 +1063,119 @@ contract LamplightEscrow {
         cureEnd = escrow.rejectedAt == 0 ? 0 : uint256(escrow.rejectedAt) + REJECT_CURE_PERIOD;
     }
 
+    /// @notice The remaining seconds on the two dispute clocks, so UIs
+    ///   never re-derive them (round 3, Oct 27, 2026, Grok improvement).
+    /// @dev arbiterTimeoutRemaining counts down from ARBITER_TIMEOUT
+    ///   while the escrow is escalated, and is 0 once the timeout is
+    ///   reached (resolveDisputeTimeout uses >=, so at the boundary the
+    ///   clock is done) or when the escrow is not escalated at all.
+    ///   challengeRemaining counts down from CHALLENGE_PERIOD while a
+    ///   challenge window is open, and is 0 once the window has closed
+    ///   (finalizeResolution uses >=) or when no challenge is open.
+    ///   Both are 0 for a settled escrow. The two clocks never run at
+    ///   once: escalation clears the challenge window and resolution
+    ///   clears the escalation.
+    ///   Boundary contract (round 4, Oct 27, 2026, Grok improvement):
+    ///   the timeout boundary is ARBITER_TIMEOUT + resolveDisputeTimeout
+    ///   (>=), the challenge boundary is CHALLENGE_PERIOD +
+    ///   finalizeResolution (>=) — this view mirrors both, so a future
+    ///   reader never has to rediscover the >= vs < rule.
+    /// @param id Escrow identifier to read.
+    /// @return arbiterTimeoutRemaining Seconds until either party may
+    ///   time out an escalated dispute, or 0 when it does not apply
+    /// @return challengeRemaining Seconds until an open challenge window
+    ///   closes, or 0 when it does not apply
+    function disputeClocks(uint256 id)
+        external
+        view
+        returns (uint256 arbiterTimeoutRemaining, uint256 challengeRemaining)
+    {
+        return _disputeClocks(escrows[id]);
+    }
+
+    /// @dev Shared clock math for disputeClocks and disputeStatus
+    ///   (round 8, Oct 28, 2026): the timeout boundary is
+    ///   ARBITER_TIMEOUT + resolveDisputeTimeout (>=), the challenge
+    ///   boundary is CHALLENGE_PERIOD + finalizeResolution (>=) —
+    ///   this mirrors both, so a future reader never has to
+    ///   rediscover the >= vs < rule.
+    function _disputeClocks(Escrow storage escrow)
+        internal
+        view
+        returns (uint256 arbiterTimeoutRemaining, uint256 challengeRemaining)
+    {
+        if (escrow.escalated && block.timestamp < escrow.escalatedAt + ARBITER_TIMEOUT) {
+            arbiterTimeoutRemaining = escrow.escalatedAt + ARBITER_TIMEOUT - block.timestamp;
+        }
+        if (escrow.challengeOpen && block.timestamp < escrow.resolvedAt + CHALLENGE_PERIOD) {
+            challengeRemaining = escrow.resolvedAt + CHALLENGE_PERIOD - block.timestamp;
+        }
+    }
+
+    /// @notice Bond status plus the two dispute clocks in one call, so
+    ///   UIs and keepers never join getEscrow + disputeClocks (round 8,
+    ///   Oct 28, 2026, Grok improvement).
+    /// @dev The clocks are exactly disputeClocks' (see its NatSpec for
+    ///   the boundary contract): 0 when they do not apply, and 0 for a
+    ///   settled escrow. bondStaked is true only while the arbiter's
+    ///   bond is actually held by the contract — false before the
+    ///   stake, and false again after the bond is returned or
+    ///   forfeited on settlement — so a caller never mistakes a
+    ///   set-but-unstaked bond for a held one. This is a per-escrow
+    ///   read only; it does not list matured ids — see maturedIds
+    ///   (round 9, Oct 28, 2026).
+    /// @param id Escrow identifier to read.
+    /// @return bondAmount The bond set at creation (0 = no bond)
+    /// @return bondStaked True while the arbiter's bond is held
+    /// @return arbiterTimeoutRemaining Seconds until either party may
+    ///   time out an escalated dispute, or 0 when it does not apply
+    /// @return challengeRemaining Seconds until an open challenge window
+    ///   closes, or 0 when it does not apply
+    function disputeStatus(uint256 id)
+        external
+        view
+        returns (
+            uint256 bondAmount,
+            bool bondStaked,
+            uint256 arbiterTimeoutRemaining,
+            uint256 challengeRemaining
+        )
+    {
+        Escrow storage escrow = escrows[id];
+        bondAmount = escrow.bondAmount;
+        bondStaked = escrow.bondStaked;
+        (arbiterTimeoutRemaining, challengeRemaining) = _disputeClocks(escrow);
+    }
+
+    /// @notice The ids of resolutions ready to finalize, so a keeper
+    ///   never scans lifecycleStatus for every id up to nextEscrowId
+    ///   (round 9, Oct 28, 2026, Grok improvement).
+    /// @dev An id is matured when it matches _isMatured exactly — the
+    ///   same definition finalizeMatured sweeps with, so the view and
+    ///   the sweep can never disagree. The escrow exists, is unsettled,
+    ///   and the CHALLENGE_PERIOD has passed (finalizeResolution uses
+    ///   >=, so the boundary second counts). The scan is bounded: at
+    ///   most `limit` ids are examined starting at `start`, so the
+    ///   call's gas stays bounded — a keeper pages with start = last
+    ///   examined id + 1. Ids at or past nextEscrowId are never
+    ///   returned. An empty range returns an empty array.
+    /// @param start First id to examine (inclusive).
+    /// @param limit How many ids to examine at most.
+    /// @return matured The matured ids in ascending order.
+    function maturedIds(uint256 start, uint256 limit) external view returns (uint256[] memory matured) {
+        uint256 end = start + limit;
+        if (end < start || end > nextEscrowId) end = nextEscrowId;
+        uint256 count;
+        for (uint256 i = start; i < end; ++i) {
+            if (_isMatured(escrows[i])) ++count;
+        }
+        matured = new uint256[](count);
+        uint256 j;
+        for (uint256 i = start; i < end; ++i) {
+            if (_isMatured(escrows[i])) matured[j++] = i;
+        }
+    }
+
     /// @notice Split this call's native payment among one to five recipients, crediting failed payouts.
     /// @dev Shares must total 10,000 basis points. The last recipient with a
     ///   nonzero share receives all rounding dust; a zero-share recipient
@@ -916,16 +1231,33 @@ contract LamplightEscrow {
     ///   it to the payer when the arbiter it was staked against timed
     ///   out. No-op when no bond was staked. A failed payout credits the
     ///   recipient for withdrawal, like every other payout here — so a
-    ///   reverting arbiter's bond is never lost, only pullable.
-    function _settleBond(Escrow storage escrow, uint256 id, bool forfeitToPayer) internal {
-        if (!escrow.bondStaked) return;
+    ///   reverting arbiter's bond is never lost, only pullable. Both
+    ///   outcomes emit the single BondSettled event (forfeited = false
+    ///   on a return, true on a forfeit), so indexers watch one event.
+    ///   Returns the settled (amount, forfeited) so a caller that also
+    ///   emits its own event — resolveDisputeTimeout's DisputeTimedOut,
+    ///   or resolveDispute's DisputeResolved — reports exactly the
+    ///   values settled here, with no second source of truth; (0, false)
+    ///   when no bond was staked.
+    ///   Round 5: only resolveDisputeTimeout uses the tuple — every
+    ///   other caller is expected to discard it, so a future reader
+    ///   should not treat the return as mandatory. Round 6:
+    ///   resolveDispute uses it too, for DisputeResolved; the other
+    ///   callers still discard it.
+    function _settleBond(Escrow storage escrow, uint256 id, bool forfeitToPayer)
+        internal
+        returns (uint256 amount, bool forfeited)
+    {
+        if (!escrow.bondStaked) return (0, false);
         escrow.bondStaked = false;
         if (forfeitToPayer) {
             _payOrCredit(escrow.payer, escrow.bondAmount);
-            emit BondForfeited(id, escrow.payer, escrow.bondAmount);
+            emit BondSettled(id, escrow.payer, escrow.bondAmount, true);
+            return (escrow.bondAmount, true);
         } else {
             _payOrCredit(escrow.arbiter, escrow.bondAmount);
-            emit BondReturned(id, escrow.arbiter, escrow.bondAmount);
+            emit BondSettled(id, escrow.arbiter, escrow.bondAmount, false);
+            return (escrow.bondAmount, false);
         }
     }
 

@@ -17,7 +17,7 @@ frozen at round 9. V2 is the only line going forward**, through the
 same loop (Grok every round; Claude + ChatGPT as final gates on a
 deploy candidate). V2 is NOT a replacement for v1 in the sense of a
 rewrite; it is the same contract plus the arbiter feature, now
-hardened through round 2 (below).
+hardened through round 9 (below).
 
 **The difference: an optional per-escrow arbiter, plus the round-2
 hardening.** Everything else is v1 round 8, unchanged — the 7-day
@@ -25,9 +25,10 @@ review window, the deadline-checked delivery, the payer reject +
 7-day cure window (one rejection per escrow), the one-time deadline
 extension (max 7 days, before the deadline), the pull-payment design
 with the 100,000-gas direct-payout cap, the packed storage, the
-`lifecycleStatus()` view, the zero-amount payout guard. Tests: 130
+`lifecycleStatus()` view, the zero-amount payout guard. Tests: 167
 Foundry tests (v1's 85, unchanged, plus 14 arbiter tests from round
-1, plus 31 round-2 tests).
+1, plus 29 round-2 unit tests + dispute invariant suite, plus
+rounds 3–9 tests).
 
 ## What the arbiter does
 
@@ -90,6 +91,41 @@ re-review) called it "the one remaining trust-model gap".
    the window is open, `release()` reverts `"Resolution pending"`,
    and `lifecycleStatus` returns a new `ChallengeOpen` state.
 
+## Rounds 3–9 hardening (Oct 27–28, 2026)
+
+3. **Dispute clocks view** (`disputeClocks`) + **single bond event**
+   (`BondSettled` replaces `BondReturned` / `BondForfeited`) +
+   **forfeit-split invariants** with a bounded `warpTime` handler
+   action, so the timeout paths are actually reached in fuzz runs.
+4. **DisputeTimedOut carries the bond outcome** (`_settleBond`
+   returns the settled amount + forfeited flag); **NatSpec
+   cross-references** on the clock views; **symmetric forfeit
+   invariant** (primary timeout forfeits, backup timeout returns).
+5. **Seeded fuzz paths** — the dispute-invariant handler seeds a
+   staked primary timeout and a staked backup timeout before the
+   random actions, so neither forfeit-split invariant can pass
+   vacuously; **shared log-scanner utility** (`test/LogScanners.sol`).
+6. **Batch finalization** (`finalizeMatured`, permissionless, skips
+   non-matured ids, duplicate-safe, failed payouts credited) +
+   **keeper script** (`scripts/keeper.sh`) + **DisputeResolved bond
+   fields** + **collapsed create overloads** (no-arbiter create
+   drops 4,493 gas by skipping zero arbiter-term writes).
+7. **Keeper receipt logging** (decodes the finalized ids from the
+   mined receipt, warns on count mismatch) + **batch cap**
+   (`MAX_FINALIZE_BATCH` = 256, reverts "Batch too large").
+8. **`disputeStatus` view** (bond amount + held + both clocks, one
+   call, shared internal with `disputeClocks`) + **explicit
+   `nonReentrant` on `deliver()` and all three creates** + **keeper
+   gas docs** (fitted per-finalization costs; Arc block gas limit
+   30,000,000 verified live on both RPCs).
+9. **Shared maturity rule** (`_isMatured`) for the sweep and the new
+   **`maturedIds(start, limit)` view** (bounded, paginated, ascending)
+   + **permissionless `autoFinalizeAfter(id)`** (single-id escape
+   hatch when the keeper is offline; same guards, path, events,
+   and bond return as `finalizeResolution`) + **shared maturity
+   guards** (`_requireMaturedResolution`). **Grok round-9 review
+   (run by Chris, Oct 28, 2026): SOUND, no findings.**
+
 ## Limits, stated plainly
 
 - **The arbiter check only compares addresses.** `createEscrow`
@@ -120,15 +156,16 @@ re-review) called it "the one remaining trust-model gap".
 
 | File | What it is |
 |---|---|
-| `contracts/LamplightEscrow.sol` | The contract (Solidity 0.8.24, MIT). V1 round 8 + optional per-escrow arbiter + round-2 hardening. Struct is 7 slots (v1: 4, v2 round 1: 5). Note: the `escrows` mapping is internal, not public — with 19 struct fields, Solidity's auto-generated public getter cannot compile (solc "stack too deep" in the tuple ABI encoding); `getEscrow(id)` is the read path. |
-| `test/LamplightEscrow.t.sol` | 130 Foundry tests — v1's 85 unchanged, plus 14 arbiter tests (round 1), plus 30 round-2 unit tests (timeout, bond, backup/challenge, event, struct round-trip) and a dispute invariant suite (2 invariants). |
+| `contracts/LamplightEscrow.sol` | The contract (Solidity 0.8.24, MIT). V1 round 8 + optional per-escrow arbiter + rounds 2–9 hardening. Struct is 7 slots (v1: 4, v2 round 1: 5). Note: the `escrows` mapping is internal, not public — with 19 struct fields, Solidity's auto-generated public getter cannot compile (solc "stack too deep" in the tuple ABI encoding); `getEscrow(id)` is the read path. |
+| `test/LamplightEscrow.t.sol` | 167 Foundry tests — v1's 85 unchanged, plus 14 arbiter tests (round 1), plus 29 round-2 unit tests + dispute invariant suite (2 invariants at round 2, 4 by round 4), plus rounds 3–9 tests (dispute clocks, bond-event fields, seeded timeout paths, batch finalization + cap, disputeStatus view, maturity view + single-id finalization). |
 | `foundry.toml` | Foundry config (same as v1, incl. the invariant pin). |
 | `studio-contract-reference.sol` | Studio's contract source BEFORE the Oct 27 revision — historical reference for the diff, not the live contract. The live contract is `contracts/LamplightEscrow.sol`. |
 
 ## Status
 
-Pushed to GitHub Oct 27, 2026 (this repo) — V2 is the deploy line. Not
-submitted anywhere yet. Gas (measured Oct 27, 2026, first
+Pushed to GitHub Oct 28, 2026 (this repo) — rounds 3–9 on top of
+round-2 head `f1ce32ec`. V2 is the deploy line. Not submitted
+anywhere yet. Gas (measured Oct 27, 2026, first
 create in a fresh test, `gasleft()` delta): `createEscrow` 137,870
 gas with no arbiter; 160,379 with an arbiter; 183,193 with arbiter +
 backup arbiter (no bond); 183,295 with arbiter + backup + bond

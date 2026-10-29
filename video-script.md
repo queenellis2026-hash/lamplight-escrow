@@ -21,9 +21,10 @@ tests passing, the app preview beside the chat.
 
 > "I built it in Arc Studio, from a plain-language description. Studio
 > wrote the Solidity, wrote the tests, and built the app around the
-> contract. Fourteen tests, all passing — the happy path, and every way
-> it should refuse: releasing before delivery, the wrong person trying
-> to deliver, refunds before the deadline."
+> contract — and the suite has grown to 167 tests, all passing: the
+> happy path, and every way it should refuse: releasing before
+> delivery, the wrong person trying to deliver, refunds before the
+> deadline."
 
 ## 0:50–1:30 — The contract (screen: repo / contract code, briefly)
 
@@ -35,9 +36,10 @@ Scroll the escrow functions; don't read the code aloud, point at it.
 > value, not as an ERC-20 transfer. Plain transfers are rejected, so
 > money only ever arrives through a tracked function. There's a
 > reentrancy guard, and the payer can only release after delivery — and
-> only the payer. Honest limit: version one has no arbitrator. If the
-> two sides disagree after delivery, the payer still holds the release.
-> That's the next version, and I'm saying it here rather than hiding it."
+> only the payer. And an optional arbiter: if the two sides disagree
+> after a cured delivery, the payer can escalate to a third-party
+> arbiter who decides — a silent arbiter costs at most 14 days, when
+> the timeout force-refunds the payer."
 
 ## 1:30–2:20 — Live on Arc mainnet [MAINNET] (screen: the app, live)
 
@@ -50,14 +52,19 @@ Scroll the escrow functions; don't read the code aloud, point at it.
    (keccak of "deliverable: lamplight-escrow demo report v1").
 4. Release: 0.27 USDC to the payee. Show the payee balance before/after.
 5. Split 0.10 USDC 50/50 to two recipients. Show both balances.
+6. Withdraw [MAINNET]: make one split share go to a non-payable
+   recipient, so its 0.05 credits instead of paying out directly —
+   settlement still completes. Then pull it with `withdraw()` from
+   the app's withdraw card and show the credited balance going to
+   zero. This is the pull-payment beat: a failed payout never blocks
+   a settlement, and nobody's money gets stuck.
 
 > "Real USDC, on Arc mainnet, moving through the contract and the app.
-> The whole demo cost about four cents of gas."
+> The whole demo cost about eleven cents of gas."
 
 ## 2:20–2:50 — Where it goes (screen: app status / repo)
 
-> "Next: an arbitrator role for disputes, scheduled payouts, and
-> payroll — same escrow, more shapes. The code is public, MIT licensed.
+> "Next: scheduled payouts, and payroll — same escrow, more shapes. The code is public, MIT licensed.
 > The payout wallet for the microgrant is on screen. Thanks — and if
 > you're an agent that does work for pay, this escrow is for you."
 
