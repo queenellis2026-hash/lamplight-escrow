@@ -1163,8 +1163,19 @@ contract LamplightEscrow {
     /// @param limit How many ids to examine at most.
     /// @return matured The matured ids in ascending order.
     function maturedIds(uint256 start, uint256 limit) external view returns (uint256[] memory matured) {
-        uint256 end = start + limit;
-        if (end < start || end > nextEscrowId) end = nextEscrowId;
+        // ChatGPT final Low fix, Oct 28, 2026: bound the range BEFORE
+        // adding. start + limit reverts on overflow under checked
+        // arithmetic before the old end < start guard could ever run,
+        // so cap via the remaining range instead. end stays
+        // nextEscrowId whenever the window runs past the last id, and
+        // the loops below stay empty when start is already past it.
+        // start + limit here cannot overflow: limit < remaining means
+        // start + limit < nextEscrowId.
+        uint256 end = nextEscrowId;
+        if (start < nextEscrowId) {
+            uint256 remaining = nextEscrowId - start;
+            if (limit < remaining) end = start + limit;
+        }
         uint256 count;
         for (uint256 i = start; i < end; ++i) {
             if (_isMatured(escrows[i])) ++count;

@@ -597,9 +597,59 @@ All items. 167/167 forge tests pass (158 + 9 new). V1 untouched
   round-2 script targeted the round-2 contract); `scripts/keeper.sh`
   is added (the keeper from rounds 6–7).
 
+## Fixed artifact — maturedIds overflow fix + three-reviewer re-review (Oct 28, 2026)
+
+- **The fix** (contracts/LamplightEscrow.sol, maturedIds only): the
+  round-9 code computed `end = start + limit` and then guarded with
+  `if (end < start || end > nextEscrowId)`. Under checked arithmetic
+  the addition itself reverts on overflow before the guard can run,
+  so a keeper paging with a huge limit saw a panic instead of the
+  bounded page. The fix bounds the range BEFORE adding: end starts
+  at nextEscrowId, and only when start is below nextEscrowId and
+  limit is below the remaining range does end become start + limit
+  (which then cannot overflow). Paging behavior is otherwise
+  unchanged. No signature, event, or struct changed; app ABI
+  unchanged (51 entries, verified against a fresh pinned-0.8.24
+  build).
+- **Regression test** (test/LamplightEscrow.t.sol,
+  testMaturedIdsOverflowInputsDoNotRevert): overflowing limit returns
+  the capped page, overflowing start returns empty, never reverts;
+  boundary pins with more than one escrow (limit exactly the
+  remaining range; start exactly nextEscrowId when nextEscrowId > 1).
+  Fail-before proof: the new test against the pre-fix contract fails
+  with panic 0x11 (arithmetic overflow). Fixed contract md5
+  8d392b64a51b617f6cd01a39e28a1d66. Suite 168/168.
+- **Re-review verdicts** (all run by Chris, Oct 28, 2026): Grok
+  SOUND, no findings. Claude SOUND, nothing blocks Sunday — 1 Low
+  (design, not a blocker): resolveDisputeTimeout after reEscalate
+  refunds the payer in full when a silent backup overturns a primary
+  payee win (pinned by testBackupArbiterTimeoutReturnsBond,
+  deliberate); fix for the post-deploy round: when challenged,
+  settle per the stored resolvedToPayee. 1 Informational (docs):
+  "Batch too large" missing from the header revert-string list —
+  left as-is, since a comment edit changes the metadata hash on a
+  frozen candidate. ChatGPT SOUND, no findings (source-based
+  verdict: ChatGPT and Claude could not run Foundry in their
+  sandboxes; the suite/md5 numbers were verified against the pinned
+  build).
+- **Post-deploy queue** (unchanged by this fix; the fix touches no
+  bond, escalation, or settlement logic): the bond-liveness Low
+  (staked arbiter bond frozen if an escrow never escalates and the
+  payer goes silent); the timeout-path pair (Claude's Low +
+  permissionless resolveDisputeTimeout); single-pass maturedIds
+  (gas-only view optimization); timeoutMatured batch; paged
+  getEscrows; the revert-string list gap; the >256-ids keeper doc
+  note (keepers must chunk before finalizeMatured); finalizeMatured
+  gas sizing at 256 matured escrows; fuzz paging property tests.
+- **Prior Studio state** (round 9): 157 Studio Foundry tests passing,
+  Arc testnet deployment 0xb6a3dacec470d04fc48a93a163f8f0d01330575c
+  (tx 0x1579ac1697694be1fa90f5a4c9402971ef5acd6d73cf0e464b3ffed3a2d17bae).
+  Studio re-verify to the fixed artifact is next; that testnet
+  deployment does not match the fixed contract.
+
 ## Tests
 
-- **167 passed, 0 failed** (`forge test` at the repo root, ~2s): v1's 85 tests
+- **168 passed, 0 failed** (`forge test` at the repo root, ~2s): v1's 85 tests
   unchanged (the two-argument `createEscrow` and the invariant handler
   work unmodified through the overloads) plus 14 arbiter tests (round 1)
   plus 29 round-2 unit tests plus a 2-invariant dispute suite plus 8
@@ -639,8 +689,9 @@ All items. 167/167 forge tests pass (158 + 9 new). V1 untouched
   settled, nonexistent id), and mixed finalization (one id via
   autoFinalizeAfter, one via finalizeMatured, one via the batch).
   Forge counts each invariant campaign as one test, so the suite
-  total is 167 (163 main-contract unit tests, including both seed
-  tests, + 2 handler-reachability unit tests + 1 balance invariant
+  total is 168 (164 main-contract unit tests, including both seed
+  tests + the maturedIds overflow regression test, + 2
+  handler-reachability unit tests + 1 balance invariant
   campaign + 1 dispute invariant campaign carrying 4 invariants).
 - Gas (round 8, measured Oct 28, 2026, not re-measured for round 9 — round 9 changes no settlement logic; see the round-9 fork-demo figures for deploy + demo gas, first create in a fresh test, `gasleft()` delta, `start` read BEFORE `vm.prank` — the prank itself costs ~4,973 gas and must sit outside the measured span): `createEscrow` 155,862 gas with no arbiter; 182,985 with an arbiter; 205,792 with arbiter + backup arbiter (no bond); 205,894 with arbiter + backup + bond. Full arbiter flow (create+deliver+reject+cure+escalate+resolve) 558,987 gas. Extended flow (bond + backup + challenge + backup resolution) 792,393 gas. `finalizeMatured` batch of 3: 124,286 gas. (Round-6 figures for comparison: 133,359 / 160,501 / 183,286 / 183,388; flows 491,644 / 724,910; batch of 3: 148,461 — see the round-6/7/8 sections above for the dated measurements and deltas.)
 - One test-expectation fix during the round: the handler's balance
@@ -651,17 +702,18 @@ All items. 167/167 forge tests pass (158 + 9 new). V1 untouched
 
 ## Next steps
 
-- Re-review: v2 round 9 reviewed by Grok (run by Chris, Oct 28, 2026):
-  SOUND, no findings. Claude + ChatGPT remain final gates on a deploy
-  candidate; reviews are run by Chris himself (Oct 28, 2026) and sent
-  to Ellis — Ellis does not run reviewer bots.
-- Push: rounds 3–9 on top of head `f1ce32ec` (round 2), app ABI
-  regenerated from the round-9 build artifact (this commit).
+- Gate closed: the fixed artifact was reviewed by all three reviewers
+  (run by Chris, Oct 28, 2026): Grok SOUND, no findings; Claude
+  SOUND, 1 Low (design, not a blocker) + 1 Informational, both
+  post-deploy; ChatGPT SOUND, no findings. Reviews are run by Chris
+  himself and sent to Ellis — Ellis does not run reviewer bots.
+- Push: this commit (fixed artifact: maturedIds bound-before-add fix
+  + overflow regression test with >1-escrow boundary pins; contract
+  md5 8d392b64a51b617f6cd01a39e28a1d66; suite 168/168; app ABI
+  unchanged, 51 entries).
 - Deploy: V2 is the deploy line and the deploy candidate (SOUND
-  commit). Studio re-verified to v2 round 9 on Oct 28, 2026
-  (contract replaced in full, byte-identical; 157 Studio Foundry
-  tests passing; fresh Arc testnet deployment
-  0xb6a3dacec470d04fc48a93a163f8f0d01330575c, tx
-  0x1579ac1697694be1fa90f5a4c9402971ef5acd6d73cf0e464b3ffed3a2d17bae). Sunday Nov 1
-  window: mainnet deploy + demo + video + DoraHacks submit before
-  11:59 PM CDT.
+  commit). Studio re-verify to the fixed artifact is next (contract
+  replaced in full, byte-identical; fresh testnet deployment to
+  follow). Sunday Nov 1 window: mainnet deploy + demo + video +
+  DoraHacks submit before 10:59 PM CDT (rules as shown read Nov 1,
+  11:59 PM ET).

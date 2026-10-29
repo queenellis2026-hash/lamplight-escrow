@@ -2767,6 +2767,46 @@ contract LamplightEscrowTest is Test, LogScanners {
         assertEq(esc.maturedIds(99, 10).length, 0);
     }
 
+    function testMaturedIdsOverflowInputsDoNotRevert() public {
+        // ChatGPT final Low, Oct 28, 2026: start + limit reverted on
+        // overflow under checked arithmetic before the old end < start
+        // guard could run, so a keeper paging with a huge limit saw a
+        // panic instead of the bounded page. The fix caps via the
+        // remaining range before adding. Overflowing inputs now return
+        // exactly the bounded page — and a start past the end still
+        // returns empty, never reverts.
+        uint256 id0 = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id0, true); // resolved at T0
+        uint256 resolvedAt0 = esc.getEscrow(id0).resolvedAt;
+        vm.warp(resolvedAt0 + 2 days); // boundary second: mature (>=)
+        uint256[] memory bounded = esc.maturedIds(0, 10);
+        assertEq(bounded.length, 1);
+        assertEq(bounded[0], id0);
+        // Overflowing limit returns the same bounded page.
+        uint256[] memory huge = esc.maturedIds(0, type(uint256).max);
+        assertEq(huge.length, 1);
+        assertEq(huge[0], id0);
+        assertEq(esc.maturedIds(1, type(uint256).max).length, 0);
+        // Overflowing start returns empty, never reverts.
+        assertEq(esc.maturedIds(type(uint256).max, type(uint256).max).length, 0);
+        // Boundary pins with more than one escrow (both re-reviewers'
+        // shared ask): limit exactly the remaining range, and start
+        // exactly nextEscrowId when nextEscrowId > 1.
+        uint256 id1 = _createWithBackup(0.5 ether, 1 days);
+        _resolvedWithBackup(id1, true); // resolved at the warped time
+        uint256 resolvedAt1 = esc.getEscrow(id1).resolvedAt;
+        vm.warp(resolvedAt1 + 2 days); // id1 matures; id0 stays mature
+        // nextEscrowId is now 2; both ids mature.
+        uint256[] memory full = esc.maturedIds(0, 2);
+        assertEq(full.length, 2);
+        assertEq(full[0], id0);
+        assertEq(full[1], id1);
+        uint256[] memory from1 = esc.maturedIds(1, 1);
+        assertEq(from1.length, 1);
+        assertEq(from1[0], id1);
+        assertEq(esc.maturedIds(2, type(uint256).max).length, 0);
+    }
+
     function testMaturedIdsMatchesFinalizeMatured() public {
         // The view and the sweep agree by construction (_isMatured):
         // every id maturedIds returns is finalized by
