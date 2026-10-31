@@ -250,6 +250,16 @@ contract LamplightEscrow {
     ///   escrow to react. Only applies when a backup arbiter was named.
     uint256 public constant CHALLENGE_PERIOD = 2 days;
 
+    /// @dev Bond waiver grace period (CRIT-02 fix, Oct 31, 2026): if
+    ///   the arbiter has not staked their bond within this long after
+    ///   delivery, the payer may escalate without the bond. 3 days —
+    ///   the arbiter gets a fair window to stake, and the payer still
+    ///   has 4 days left in the 7-day review window to escalate. Without
+    ///   this, a passive arbiter who never stakes permanently blocks
+    ///   escalation, letting the payee drain the escrow after 7 days
+    ///   regardless of work quality.
+    uint256 public constant BOND_WAIVER_PERIOD = 3 days;
+
     /// @dev Max ids in one finalizeMatured batch (round 7, Oct 28,
     ///   2026, Grok improvement): 256. The loop is no longer
     ///   unbounded — a careless or malicious batch cannot run the call
@@ -595,14 +605,17 @@ contract LamplightEscrow {
     ///   (rejectedOnce set and delivered again), only while the review
     ///   window is still open, and only when an arbiter was set at
     ///   creation. When a bond was set at creation, the arbiter must
-    ///   have staked it first — an unstaked bond blocks escalation, so
-    ///   the payer cannot escalate to an arbiter who has not put money
-    ///   behind acting. While escalated, neither party can release — only
-    ///   the arbiter resolves, or either party times it out after
-    ///   ARBITER_TIMEOUT (see resolveDisputeTimeout). The arbiter is
-    ///   whoever the payer named; the check cannot prove independence,
-    ///   so the payee should have read the arbiter before accepting the
-    ///   work.
+    ///   have staked it first — UNLESS the bond waiver period (3 days
+    ///   from delivery) has passed without a stake, in which case the
+    ///   payer may escalate without the bond (CRIT-02 fix, Oct 31,
+    ///   2026). An unstaked bond must not permanently block escalation,
+    ///   or a passive arbiter lets the payee drain the escrow after 7
+    ///   days regardless of work quality. While escalated, neither party
+    ///   can release — only the arbiter resolves, or either party times
+    ///   it out after ARBITER_TIMEOUT (see resolveDisputeTimeout). The
+    ///   arbiter is whoever the payer named; the check cannot prove
+    ///   independence, so the payee should have read the arbiter before
+    ///   accepting the work.
     /// @param id Existing, delivered, unsettled escrow identifier.
     function escalateDispute(uint256 id) external nonReentrant {
         Escrow storage escrow = escrows[id];
@@ -614,7 +627,19 @@ contract LamplightEscrow {
         require(escrow.deliveredAt != 0, "Not delivered");
         require(!escrow.escalated, "Already escalated");
         require(!escrow.challengeOpen, "Resolution pending");
-        require(escrow.bondAmount == 0 || escrow.bondStaked, "Bond not staked");
+        // CRIT-02 fix: allow bond waiver after the grace period so a
+        // passive arbiter cannot permanently block escalation. When
+        // waived, the bond amount is zeroed — there is no bond to
+        // settle later, keeping downstream logic clean.
+        bool bondWaived = escrow.bondAmount > 0 && !escrow.bondStaked
+            && block.timestamp >= escrow.deliveredAt + BOND_WAIVER_PERIOD;
+        require(
+            escrow.bondAmount == 0 || escrow.bondStaked || bondWaived,
+            "Bond not staked"
+        );
+        if (bondWaived) {
+            escrow.bondAmount = 0;
+        }
         require(block.timestamp < escrow.deliveredAt + REVIEW_PERIOD, "Review period ended");
 
         escrow.escalated = true;
@@ -625,18 +650,22 @@ contract LamplightEscrow {
     /// @notice Resolve an escalated dispute: release to the payee or refund the payer.
     /// @dev Only the escrow's arbiter — or, after a re-escalation, only
     ///   the backup arbiter — only while escalated, only once per
-    ///   escalation. True pays the full amount to the payee; false
-    ///   refunds the full amount to the payer. A failed payout credits
-    ///   the recipient for withdrawal; the escrow remains settled.
-    ///   When a backup arbiter was named, the FIRST resolution does NOT
-    ///   pay out and does NOT settle: it records the decision and opens
-    ///   the CHALLENGE_PERIOD window, so either party may re-escalate
-    ///   to the backup arbiter (see reEscalate) and the payout is
-    ///   deferred until the challenge is answered or the window closes
-    ///   (see finalizeResolution). A resolution by the backup arbiter
-    ///   is final — it pays out immediately and settles, with no
-    ///   further challenge. The staked bond, if any, returns to the
-    ///   arbiter on every resolution except a timeout forfeit.
+    ///   escalation, and only BEFORE the arbiter timeout is reached
+    ///   (MED-04 fix, Oct 31, 2026). Once ARBITER_TIMEOUT passes, only
+    ///   resolveDisputeTimeout may settle — this hard cutoff eliminates
+    ///   the mempool race where a late arbiter ruling and a timeout call
+    ///   compete at the exact boundary. True pays the full amount to the
+    ///   payee; false refunds the full amount to the payer. A failed
+    ///   payout credits the recipient for withdrawal; the escrow remains
+    ///   settled. When a backup arbiter was named, the FIRST resolution
+    ///   does NOT pay out and does NOT settle: it records the decision
+    ///   and opens the CHALLENGE_PERIOD window, so either party may
+    ///   re-escalate to the backup arbiter (see reEscalate) and the
+    ///   payout is deferred until the challenge is answered or the
+    ///   window closes (see finalizeResolution). A resolution by the
+    ///   backup arbiter is final — it pays out immediately and settles,
+    ///   with no further challenge. The staked bond, if any, returns to
+    ///   the arbiter on every resolution except a timeout forfeit.
     /// @param id Existing, escalated, unsettled escrow identifier.
     /// @param releaseToPayee True pays the payee; false refunds the payer.
     function resolveDispute(uint256 id, bool releaseToPayee) external nonReentrant {
@@ -649,6 +678,13 @@ contract LamplightEscrow {
         }
         require(!escrow.settled, "Already settled");
         require(escrow.escalated, "Not escalated");
+        // MED-04 fix: the arbiter loses the right to resolve once the
+        // timeout is reached — only resolveDisputeTimeout may settle
+        // from here. Deterministic cutoff, no mempool race.
+        require(
+            block.timestamp < escrow.escalatedAt + ARBITER_TIMEOUT,
+            "Arbiter timeout reached"
+        );
 
         if (!escrow.challenged && escrow.backupArbiter != address(0)) {
             // First resolution with a backup arbiter named: record the
@@ -681,10 +717,15 @@ contract LamplightEscrow {
         emit DisputeResolved(id, msg.sender, releaseToPayee, resolvedBondAmount, resolvedBondForfeited);
     }
 
-    /// @notice Force-refund an escrow whose arbiter has been silent too long.
+    /// @notice Force-settle an escrow whose arbiter has been silent too long.
     /// @dev Either party — payer or payee — only while escalated, only
     ///   once ARBITER_TIMEOUT (14 days) has passed since the (re-)escalation.
-    ///   The full escrow amount refunds to the payer and the escrow
+    ///   If the dispute was re-escalated (challenged) and the BACKUP
+    ///   arbiter timed out, the PRIMARY arbiter's recorded ruling is
+    ///   AFFIRMED — the payout follows resolvedToPayee. A timed-out
+    ///   appeal must never reverse the judgment under review (CRIT-01
+    ///   fix, Oct 31, 2026). If the PRIMARY arbiter timed out (not
+    ///   challenged), the full amount refunds to the payer. The escrow
     ///   settles; the arbiter can no longer resolve it. The bond is
     ///   forfeited to the payer when the SILENT arbiter is the one who
     ///   staked it — i.e. a timeout of the primary arbiter. If the
@@ -712,8 +753,21 @@ contract LamplightEscrow {
         escrow.escalated = false;
         escrow.challengeOpen = false;
         escrow.resolvedAt = 0;
-        _payOrCredit(escrow.payer, escrow.amount);
-        emit Refunded(id, escrow.payer, escrow.amount);
+        if (escrow.challenged) {
+            // CRIT-01 fix: backup arbiter timed out on appeal — affirm
+            // the primary arbiter's recorded ruling instead of reversing it.
+            if (escrow.resolvedToPayee) {
+                _payOrCredit(escrow.payee, escrow.amount);
+                emit Released(id, escrow.payee, escrow.amount);
+            } else {
+                _payOrCredit(escrow.payer, escrow.amount);
+                emit Refunded(id, escrow.payer, escrow.amount);
+            }
+        } else {
+            // Primary arbiter timed out — refund the payer.
+            _payOrCredit(escrow.payer, escrow.amount);
+            emit Refunded(id, escrow.payer, escrow.amount);
+        }
         (uint256 timedOutBondAmount, bool timedOutBondForfeited) = _settleBond(escrow, id, forfeitBond);
         emit DisputeTimedOut(id, msg.sender, timedOutBondAmount, timedOutBondForfeited);
     }
@@ -823,7 +877,16 @@ contract LamplightEscrow {
     /// @return finalized How many resolutions were finalized.
     function finalizeMatured(uint256[] calldata ids) external nonReentrant returns (uint256 finalized) {
         require(ids.length <= MAX_FINALIZE_BATCH, "Batch too large");
+        // MED-03 fix: stop the batch if insufficient gas remains.
+        // The 35k covers loop overhead (SLOADs, event data) above the
+        // payout itself. Without this, a mid-batch out-of-gas in
+        // _payOrCredit reverts the entire batch, rolling back all
+        // previous settlements and wasting keeper gas. Breaking here
+        // keeps completed settlements; the keeper re-calls with the
+        // remaining ids.
+        uint256 minGasPerItem = (PAYOUT_GAS_LIMIT * 64) / 63 + PAYOUT_GAS_BUFFER + 35_000;
         for (uint256 i = 0; i < ids.length; ++i) {
+            if (gasleft() < minGasPerItem) break;
             if (_isMatured(escrows[ids[i]])) {
                 _finalizeResolution(ids[i]);
                 ++finalized;
@@ -1176,14 +1239,21 @@ contract LamplightEscrow {
             uint256 remaining = nextEscrowId - start;
             if (limit < remaining) end = start + limit;
         }
+        // LOW-05 fix, Oct 31, 2026: single storage pass. The old code
+        // called _isMatured (SLOADs on slots 0, 2, 6) twice per id —
+        // once to count, once to fill. Now we collect into a temp
+        // array in one pass, then copy to the exact-size result.
+        // The copy loop is memory-only (cheap); storage is read once.
+        uint256[] memory temp = new uint256[](end > start ? end - start : 0);
         uint256 count;
         for (uint256 i = start; i < end; ++i) {
-            if (_isMatured(escrows[i])) ++count;
+            if (_isMatured(escrows[i])) {
+                temp[count++] = i;
+            }
         }
         matured = new uint256[](count);
-        uint256 j;
-        for (uint256 i = start; i < end; ++i) {
-            if (_isMatured(escrows[i])) matured[j++] = i;
+        for (uint256 j = 0; j < count; ++j) {
+            matured[j] = temp[j];
         }
     }
 

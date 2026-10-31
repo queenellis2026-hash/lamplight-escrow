@@ -2261,7 +2261,9 @@ contract LamplightEscrowTest is Test, LogScanners {
     function testBackupArbiterTimeoutReturnsBond() public {
         // The bond is the PRIMARY arbiter's stake, and it acted — so a
         // timeout of the BACKUP arbiter forfeits nothing: the bond
-        // returns to the primary arbiter and the payer is refunded.
+        // returns to the primary arbiter. CRIT-01 fix (Oct 31, 2026):
+        // the primary's ruling (for the payee) is AFFIRMED on backup
+        // timeout — the payee is paid, the payer is not refunded.
         uint256 id = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
         vm.prank(arbiter);
         esc.stakeBond{value: 0.1 ether}(id);
@@ -2273,7 +2275,8 @@ contract LamplightEscrowTest is Test, LogScanners {
         vm.prank(payee);
         esc.resolveDisputeTimeout(id);
         assertTrue(esc.getEscrow(id).settled);
-        assertEq(payer.balance, 100 ether); // refunded in full
+        assertEq(payee.balance, 1.5 ether); // primary ruling affirmed: payee paid
+        assertEq(payer.balance, 99.5 ether); // payer not refunded
         assertEq(arbiter.balance, 10 ether); // bond returned, not forfeited
         assertEq(address(esc).balance, 0);
     }
@@ -3332,7 +3335,9 @@ contract LamplightEscrowTest is Test, LogScanners {
         // arbiter resolved in time, the backup timed out, so the bond
         // must come back to the primary — proved by the balances AND
         // by the BondSettled event (recipient = arbiter, forfeited =
-        // false), never by a forfeit to the payer.
+        // false), never by a forfeit to the payer. CRIT-01 fix (Oct 31,
+        // 2026): the primary's ruling (for the payee) is affirmed —
+        // the payee is paid, not the payer refunded.
         uint256 id = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
         vm.prank(arbiter);
         esc.stakeBond{value: 0.1 ether}(id);
@@ -3351,7 +3356,8 @@ contract LamplightEscrowTest is Test, LogScanners {
         assertEq(amount, 0.1 ether);
         assertFalse(forfeited);
         assertTrue(esc.getEscrow(id).settled);
-        assertEq(payer.balance, 100 ether); // refunded in full, no bond windfall
+        assertEq(payee.balance, 1.5 ether); // primary ruling affirmed: payee paid
+        assertEq(payer.balance, 99.5 ether); // not refunded
         assertEq(arbiter.balance, 10 ether); // bond returned, not forfeited
         assertEq(address(esc).balance, 0);
     }
@@ -3393,7 +3399,8 @@ contract LamplightEscrowTest is Test, LogScanners {
         // A backup-arbiter timeout with a staked bond: DisputeTimedOut
         // carries amount = the bond, forfeited = false — the bond
         // returns to the primary arbiter, and this event says so on
-        // its own.
+        // its own. CRIT-01 fix (Oct 31, 2026): the primary's ruling
+        // (for the payee) is affirmed — the payee is paid.
         uint256 id = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
         vm.prank(arbiter);
         esc.stakeBond{value: 0.1 ether}(id);
@@ -3418,9 +3425,74 @@ contract LamplightEscrowTest is Test, LogScanners {
         assertEq(bAmount, bondAmount);
         assertEq(bForfeited, bondForfeited);
         assertTrue(esc.getEscrow(id).settled);
-        assertEq(payer.balance, 100 ether); // refunded in full, no bond windfall
+        assertEq(payee.balance, 1.5 ether); // primary ruling affirmed: payee paid
+        assertEq(payer.balance, 99.5 ether); // not refunded
         assertEq(arbiter.balance, 10 ether); // bond returned, not forfeited
         assertEq(address(esc).balance, 0);
+    }
+
+    // ---- CRIT-01 regression (Oct 31, 2026): backup timeout affirms primary ruling ----
+
+    function testBackupTimeoutAffirmsPrimaryRulingForPayee() public {
+        // The Free Appeal Loophole: primary rules for payee, payer
+        // re-escalates for free, backup stays silent. The timeout MUST
+        // affirm the primary's ruling (pay the payee), not refund the
+        // payer. This is the exact exploit trace from the audit.
+        uint256 id = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        _resolvedWithBackup(id, true); // primary: payee wins
+        vm.prank(payer);
+        esc.reEscalate(id); // payer appeals for free
+        uint256 escalatedAt = esc.getEscrow(id).escalatedAt;
+        vm.warp(escalatedAt + 14 days); // backup silent
+        vm.prank(payer);
+        esc.resolveDisputeTimeout(id);
+        // Primary ruling affirmed: payee paid, not payer refunded.
+        assertEq(payee.balance, 1.5 ether);
+        assertEq(payer.balance, 99.5 ether);
+        assertTrue(esc.getEscrow(id).settled);
+    }
+
+    function testBackupTimeoutAffirmsPrimaryRulingForPayer() public {
+        // Mirror case: primary rules for the PAYER (refund), payer
+        // re-escalates (or payee does), backup times out. The timeout
+        // affirms: payer refunded.
+        uint256 id = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
+        vm.prank(arbiter);
+        esc.stakeBond{value: 0.1 ether}(id);
+        _resolvedWithBackup(id, false); // primary: payer wins (refund)
+        vm.prank(payee);
+        esc.reEscalate(id); // payee appeals
+        uint256 escalatedAt = esc.getEscrow(id).escalatedAt;
+        vm.warp(escalatedAt + 14 days); // backup silent
+        vm.prank(payee);
+        esc.resolveDisputeTimeout(id);
+        // Primary ruling affirmed: payer refunded.
+        assertEq(payer.balance, 100 ether);
+        assertEq(payee.balance, 1 ether);
+        assertTrue(esc.getEscrow(id).settled);
+    }
+
+    // ---- CRIT-02 regression (Oct 31, 2026): bond waiver after grace period ----
+
+    function testEscalateSucceedsAfterBondWaiverPeriod() public {
+        // The Unstaked Bond Trap: arbiter never stakes, payer cannot
+        // escalate, payee drains after 7 days. After BOND_WAIVER_PERIOD
+        // (3 days) from delivery, the payer may escalate without the bond.
+        uint256 id = _createWithBackupAndBond(0.5 ether, 1 days, 0.1 ether);
+        // Note: arbiter does NOT stake the bond.
+        _rejectAndCure(id);
+        // Within waiver period: escalation reverts.
+        vm.expectRevert("Bond not staked");
+        vm.prank(payer);
+        esc.escalateDispute(id);
+        // After waiver period: escalation succeeds.
+        uint256 deliveredAt = esc.getEscrow(id).deliveredAt;
+        vm.warp(deliveredAt + 3 days);
+        vm.prank(payer);
+        esc.escalateDispute(id);
+        assertTrue(esc.getEscrow(id).escalated);
     }
 
     // ---- Round 6: DisputeResolved carries the bond outcome ----
@@ -4042,9 +4114,11 @@ contract LamplightEscrowDisputeInvariantTest is Test, LogScanners {
         handler.seedPrimaryTimeout();
         // Round 6: seed one backup-timeout path as well, so both
         // sides of the forfeit-split rule are exercised from the very
-        // first check. The seed is ids[1]; it is balance-neutral (the
-        // timeout refunds the amount and returns the bond), so the
-        // balance assertions below are unchanged from round 5.
+        // first check. The seed is ids[1]. CRIT-01 fix (Oct 31, 2026):
+        // the backup timeout AFFIRMS the primary's ruling (for the
+        // payee) — the handler (payer) is 0.01 ether down from this
+        // seed, not balance-neutral as before. The balance assertions
+        // below account for it.
         handler.seedBackupTimeout();
         // Round 9: seed one challenge-open-then-finalize path as
         // well, so the deferred-payout branch is exercised from the
@@ -4179,11 +4253,13 @@ contract LamplightEscrowDisputeInvariantTest is Test, LogScanners {
         assertFalse(handler.primaryTimeoutFailedToForfeitBond());
         assertTrue(esc.getEscrow(3).settled);
         // The handler is the payer: it funded 0.01, and the timeout
-        // refunds it AND forfeits the arbiter's 0.001 bond to it —
-        // so it ends 0.001 ahead of the 100 ether it was dealt, plus
-        // the 0.001 the seed forfeited to it in setUp, minus the 0.01
-        // the finalize seed paid out.
-        assertEq(address(handler).balance, 99.992 ether);
+        // refunds it AND forfeits the arbiter's 0.001 bond to it.
+        // CRIT-01 fix (Oct 31, 2026): the backup-timeout seed (ids[1])
+        // is no longer balance-neutral — the primary's ruling for the
+        // payee is affirmed, costing the handler 0.01. So: 100 + 0.001
+        // (this timeout's bond) + 0.001 (primary seed's bond) - 0.01
+        // (finalize seed's payout) - 0.01 (backup seed's affirmed payout).
+        assertEq(address(handler).balance, 99.982 ether);
         assertEq(handler.arbiterAddr().balance, 9.998 ether); // both bonds lost
         (bool found, address recipient, uint256 amount, bool forfeited) = _findBondSettled(logs);
         assertTrue(found);
@@ -4212,7 +4288,10 @@ contract LamplightEscrowDisputeInvariantTest is Test, LogScanners {
         assertEq(handler.primaryTimeoutsSucceeded(), 1);
         assertFalse(handler.primaryTimeoutFailedToForfeitBond());
         assertTrue(esc.getEscrow(0).settled);
-        assertEq(address(handler).balance, 99.991 ether);
+        // CRIT-01 fix (Oct 31, 2026): the backup-timeout seed (ids[1])
+        // now costs the handler 0.01 (primary ruling affirmed for payee).
+        // 100 + 0.001 (primary seed bond) - 0.01 (backup seed) - 0.01 (finalize seed).
+        assertEq(address(handler).balance, 99.981 ether);
         assertEq(handler.arbiterAddr().balance, 9.999 ether);
     }
 
@@ -4224,13 +4303,11 @@ contract LamplightEscrowDisputeInvariantTest is Test, LogScanners {
     ///   seeded escrow is settled, and the seeded-timeout flag is
     ///   set. If the seed ever stops running (or the timeout stops
     ///   succeeding), this fails — the fuzz invariant can no longer
-    ///   silently pass vacuously. The seed is balance-neutral (the
-    ///   timeout refunds the amount and returns the bond), so the
-    ///   balances are the same as the primary-seed test: the handler
-    ///   is 99.991 ether and the arbiter 9.999 ether, both moved
-    ///   only by the primary seed's forfeit and the finalize seed's
-    ///   payout. Round 9: the handler figure drops by the finalize
-    ///   seed's 0.01 payout from the round-6 figure.
+    ///   silently pass vacuously. CRIT-01 fix (Oct 31, 2026): the
+    ///   backup timeout AFFIRMS the primary's ruling (for the payee),
+    ///   so the handler is 0.01 down from this seed — not balance-neutral.
+    ///   Balances: handler 99.981 (100 + 0.001 primary forfeit - 0.01
+    ///   backup affirm - 0.01 finalize payout), arbiter 9.999.
     function testSeededBackupTimeoutIsReached() public {
         assertTrue(handler.seededBackup());
         assertEq(handler.seededBackupId(), 1);
@@ -4238,7 +4315,7 @@ contract LamplightEscrowDisputeInvariantTest is Test, LogScanners {
         assertEq(handler.backupTimeoutsSucceeded(), 1);
         assertFalse(handler.backupTimeoutForfeitedPrimaryBond());
         assertTrue(esc.getEscrow(1).settled);
-        assertEq(address(handler).balance, 99.991 ether);
+        assertEq(address(handler).balance, 99.981 ether);
         assertEq(handler.arbiterAddr().balance, 9.999 ether);
     }
 
@@ -4263,8 +4340,11 @@ contract LamplightEscrowDisputeInvariantTest is Test, LogScanners {
         assertTrue(esc.getEscrow(2).settled);
         assertFalse(esc.getEscrow(2).challengeOpen);
         assertEq(uint256(esc.lifecycleStatus(2)), uint256(LamplightEscrow.Lifecycle.Settled));
-        assertEq(handler.payee().balance, 0.01 ether);
-        assertEq(address(handler).balance, 99.991 ether);
+        // CRIT-01 fix (Oct 31, 2026): the backup-timeout seed (ids[1])
+        // now pays the payee 0.01 (primary ruling affirmed), plus the
+        // 0.01 from this finalize seed = 0.02 total.
+        assertEq(handler.payee().balance, 0.02 ether);
+        assertEq(address(handler).balance, 99.981 ether);
         assertEq(handler.arbiterAddr().balance, 9.999 ether);
     }
 }
