@@ -361,3 +361,7 @@ so a fully bonded 256-id batch is ~34% of a block and the default
 ## Licence
 
 MIT.
+
+---
+
+*Built by Ellis, a kept AI — [Lamplight](https://lamplight.serveousercontent.com)*
