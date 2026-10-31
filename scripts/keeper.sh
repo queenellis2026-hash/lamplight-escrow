@@ -9,11 +9,12 @@
 # it SKIPS ids that are not matured instead of reverting, so this
 # keeper can sweep blindly.
 #
-# What the keeper watches: escrows whose lifecycle is ChallengeOpen
-# (lifecycleStatus == 9). It passes those ids to finalizeMatured in
-# batches; the contract itself decides which are matured (challenge
-# window closed) and skips the rest, so a window closing between the
-# scan and the call is harmless.
+# What the keeper watches: escrows whose dispute resolutions are matured
+# (challenge window closed, payout deferred until finalization). It reads
+# those ids from the contract's maturedIds view — paged, so the scan is
+# bounded — and passes them to finalizeMatured in batches; the contract
+# itself decides which are matured, so a window closing between the scan
+# and the call is harmless (finalizeMatured skips non-matured ids).
 #
 # How often: the challenge window is 2 days, so once a day is plenty —
 # a resolution can never sit more than a day past maturity. Run it as
@@ -99,9 +100,12 @@ if [ "${1:-}" = "--dry-run" ]; then
     DRY_RUN=1
 fi
 
-# lifecycleStatus enum: 9 = ChallengeOpen (arbiter resolved, challenge
-# window open, payout deferred until it closes or is answered).
-CHALLENGE_OPEN=9
+# maturedIds paging (round 9, Oct 28, 2026): the contract itself
+# lists which ids are ready to finalize, so the keeper never scans
+# lifecycleStatus for every id up to nextEscrowId. Page with
+# start = last examined id + 1 until a page comes back short or the
+# scan passes nextEscrowId.
+PAGE_SIZE="${PAGE_SIZE:-1000}"
 
 # Event topic0 hashes (keccak of the canonical signatures), for
 # decoding a sweep receipt's logs. Released / Refunded carry the
@@ -113,19 +117,32 @@ TOPIC_BATCH=0x44603c1cec76f6948dbab2a67210399b04495f360dce9201289fc730e8cdd63e
 
 next_id="$("$CAST" call "$ESCROW_ADDRESS" "nextEscrowId()(uint256)" --rpc-url "$RPC_URL")"
 candidates=()
-for ((id = 0; id < next_id; id++)); do
-    status="$("$CAST" call "$ESCROW_ADDRESS" "lifecycleStatus(uint256)(uint8)" "$id" --rpc-url "$RPC_URL")"
-    if [ "$status" -eq "$CHALLENGE_OPEN" ]; then
+start=0
+while [ "$start" -lt "$next_id" ]; do
+    # maturedIds(start, limit) returns uint256[] of ids ready to
+    # finalize. Parse cast's array output ("[0, 3, 7]") into ids.
+    page_ids="$("$CAST" call "$ESCROW_ADDRESS" "maturedIds(uint256,uint256)(uint256[])" "$start" "$PAGE_SIZE" --rpc-url "$RPC_URL" | python3 -c '
+import sys, re
+print(" ".join(re.findall(r"\d+", sys.stdin.read())))
+')"
+    count=0
+    # shellcheck disable=SC2086
+    for id in $page_ids; do
         candidates+=("$id")
+        count=$((count + 1))
+    done
+    if [ "$count" -eq 0 ]; then
+        break
     fi
+    start=$((start + PAGE_SIZE))
 done
 
 if [ "${#candidates[@]}" -eq 0 ]; then
-    echo "keeper: no challenge-open resolutions (0..$((next_id - 1)) scanned)"
+    echo "keeper: no matured resolutions (0..$((next_id - 1)) scanned via maturedIds)"
     exit 0
 fi
 
-echo "keeper: ${#candidates[@]} challenge-open resolution(s): ${candidates[*]}"
+echo "keeper: ${#candidates[@]} matured resolution(s): ${candidates[*]}"
 
 # Decode one sweep receipt (JSON on stdin) into the finalized ids and
 # the batch count: prints "<count> <id> <id> ..." — the count from the
